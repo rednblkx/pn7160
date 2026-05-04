@@ -1,11 +1,11 @@
 /* --- pn7160_spi.hpp --- */
 #pragma once
 
-#include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "soc/gpio_num.h"
 
 #include <cstdint>
 #include <functional>
@@ -269,7 +269,6 @@ public:
                                uint8_t interface);
     esp_err_t rf_deactivate(uint8_t type);
     esp_err_t rf_iso_dep_presence_check();
-    void presence_check_runner();
 
     // Send raw NCI command and get response
     // Returns NCI Status Code from the response (e.g., STATUS_OK)

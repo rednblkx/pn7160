@@ -1,10 +1,11 @@
 /* --- pn7160_spi.cpp --- */
 #include "pn7160_spi.hpp"
 
+#include "driver/gpio.h"
 #include "esp_check.h"
 #include "esp_err.h"
-#include "esp_idf_version.h" // For ESP_IDF_VERSION_VAL
 #include "esp_log.h"
+#include "esp_log_buffer.h"
 #include "esp_log_level.h"
 #include "esp_rom_sys.h" // For esp_rom_delay_us
 #include "freertos/idf_additions.h"
@@ -390,7 +391,7 @@ esp_err_t PN7160_SPI::wait_for_irq(bool expected_state,
         }
     } else {
         // Timeout occurred
-        ESP_LOGW(TAG, "Timeout waiting for IRQ HIGH");
+        // ESP_LOGW(TAG, "Timeout waiting for IRQ HIGH");
         // Check the state again in case the interrupt happened just after timeout
         if (gpio_get_level(pins_.irq) == expected_state) {
              ESP_LOGW(TAG, "IRQ became HIGH right after timeout check");
@@ -1062,7 +1063,6 @@ esp_err_t PN7160_SPI::rf_deactivate(uint8_t type) {
 
 esp_err_t PN7160_SPI::rf_iso_dep_presence_check() {
     if (!initialized_) return ESP_ERR_INVALID_STATE;
-    // Check if ISO-DEP interface is likely active? (Optional, based on app state)
 
     NciMessage cmd(NCI_PKT_MT_CTRL_COMMAND, RF_GID, RF_ISO_DEP_NAK_PRESENCE_OID);
     NciMessage rsp;
@@ -1078,18 +1078,6 @@ esp_err_t PN7160_SPI::rf_iso_dep_presence_check() {
 }
 
 // --- Task Runner ---
-
-void PN7160_SPI::presence_check_runner() {
-    while (selected_tag_still_in_field) {
-        esp_err_t status = rf_iso_dep_presence_check();
-        if(status != STATUS_OK){
-            rf_deactivate(DEACTIVATION_TYPE_DISCOVERY);
-        }
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
-    ESP_LOGI(TAG, "Tag no longer in field, exiting runner");
-    rf_deactivate(DEACTIVATION_TYPE_DISCOVERY);
-}
 
 void PN7160_SPI::task_runner() {
     if (!initialized_) {
@@ -1132,10 +1120,11 @@ void PN7160_SPI::task_runner() {
                             // --- Standard Notification Handling ---
                             if (incoming_msg.get_gid() == RF_GID) {
                                 switch (incoming_msg.get_oid()) {
-                                    case RF_INTF_ACTIVATED_OID: // Standard case - might not happen with this FW
-                                        ESP_LOGD(TAG, "RF_INTF_ACTIVATED_NTF received");
+                                    case RF_INTF_ACTIVATED_OID:
+                                        ESP_LOGD(TAG, "RF_INTF_ACTIVATED_NTF: DiscID=0x%02X Intf=0x%02X Proto=0x%02X Mode=0x%02X",
+                                                incoming_msg.buffer[3], incoming_msg.buffer[4],
+                                                incoming_msg.buffer[5], incoming_msg.buffer[6]);
                                         selected_tag_still_in_field.store(true);
-                                        selected_tag_still_in_field.notify_all();
                                         if (on_rf_intf_activated_) on_rf_intf_activated_(incoming_msg);
                                         break;
                                     case RF_DISCOVER_OID:
@@ -1148,16 +1137,12 @@ void PN7160_SPI::task_runner() {
                                         uint8_t deact_reason = incoming_msg.buffer[4];
                                         ESP_LOGD(TAG, "RF_DEACTIVATE_NTF received. Type: 0x%02X, Reason: 0x%02X", deact_type, deact_reason);
                     
-                                        // --- Check for Link Loss ---
                                         if (deact_reason == 0x02) { // 0x02 = RF_Link_Loss
                                             ESP_LOGW(TAG, "Tag removed (RF Link Loss detected by NFCC)!");
                                         } else {
-                                            // Handle other deactivation reasons if necessary (e.g., DH_Request, Endpoint_Request)
                                             ESP_LOGD(TAG, "Deactivation reason was not Link Loss.");
                                         }
-                                        // --- End Check ---
                     
-                                        // Call generic deactivate callback regardless of reason?
                                         if (on_rf_deactivate_)
                                             on_rf_deactivate_(incoming_msg);
                     
@@ -1165,24 +1150,19 @@ void PN7160_SPI::task_runner() {
                                         ESP_LOGW(TAG, "RF_DEACTIVATE_NTF payload too short (%d bytes)", incoming_msg.get_len());
                                     }
                                     break;
-                                    case RF_ISO_DEP_NAK_PRESENCE_OID:
-                                        if (incoming_msg.get_len() >= 1) {
-                                            uint8_t presence_status = incoming_msg.buffer[3]; // Status is first payload byte
-                                            ESP_LOGD(TAG, "RF_ISO_DEP_NAK_PRESENCE_NTF received. Status: 0x%02X", presence_status);
-                                            if (presence_status != STATUS_OK) {
-                                                ESP_LOGW(TAG, "RF_ISO_DEP_NAK_PRESENCE_NTF returned status %d!", presence_status);
-                                                // rf_deactivate(DEACTIVATION_TYPE_DISCOVERY);
-                                                selected_tag_still_in_field.store(false);
-                                                selected_tag_still_in_field.notify_all();
-                                            } else {
-                                                ESP_LOGD(TAG, "RF_ISO_DEP_NAK_PRESENCE_NTF: OK");
-                                            }
+                                    case RF_ISO_DEP_NAK_PRESENCE_OID: {  // CTRL_NOTIFICATION
+                                        esp_log_buffer_hexdump_internal(TAG, incoming_msg.buffer.data(), incoming_msg.buffer.size(), ESP_LOG_DEBUG);
+                                        uint8_t presence = incoming_msg.buffer[3];
+                                        if (presence != 0x00) {
+                                            ESP_LOGW(TAG, "Tag no longer in field");
+                                            selected_tag_still_in_field.store(false);
+                                            rf_deactivate(DEACTIVATION_TYPE_DISCOVERY);
                                         } else {
-                                                ESP_LOGW(TAG, "RF_ISO_DEP_NAK_PRESENCE_NTF payload too short.");
+                                            ESP_LOGD(TAG, "Tag still in field");
+                                            rf_iso_dep_presence_check();
                                         }
-                                        // Optionally call a generic core notification callback too
-                                        if (on_core_notification_) on_core_notification_(incoming_msg);
-                                    break;
+                                        break;
+                                    }
                                     default:
                                         ESP_LOGW(TAG, "Unhandled RF Notification OID: 0x%02X", incoming_msg.get_oid());
                                         break;
@@ -1232,18 +1212,14 @@ void PN7160_SPI::task_runner() {
                                     break;
                                     case RF_ISO_DEP_NAK_PRESENCE_OID:{
                                         if (incoming_msg.get_len() >= 1) {
-                                            uint8_t presence_status = incoming_msg.buffer[3]; // Status is first payload byte
+                                            uint8_t presence_status = incoming_msg.buffer[3];
                                             ESP_LOGD(TAG, "RF_ISO_DEP_NAK_PRESENCE_RSP received. Status: 0x%02X", presence_status);
                                             if (presence_status != STATUS_OK) {
-                                                ESP_LOGD(TAG, "Tag not present anymore according to ISO-DEP check!");
-                                            } else {
-                                                ESP_LOGD(TAG, "Tag still present.");
+                                                rf_deactivate(DEACTIVATION_TYPE_DISCOVERY);
                                             }
                                         } else {
-                                                ESP_LOGW(TAG, "RF_ISO_DEP_NAK_PRESENCE_RSP payload too short.");
+                                            ESP_LOGW(TAG, "RF_ISO_DEP_NAK_PRESENCE_RSP payload too short.");
                                         }
-                                        // Optionally call a generic core notification callback too
-                                        if (on_core_notification_) on_core_notification_(incoming_msg);
                                     }
                                     break;
                                 }
@@ -1251,21 +1227,16 @@ void PN7160_SPI::task_runner() {
                                 switch (incoming_msg.get_oid()) {
                                     case NCI_CORE_GENERIC_ERROR_OID:
                                         ESP_LOGW(TAG, "CORE_GENERIC_ERROR_RSP Status: 0x%X", incoming_msg.get_status());
-                                        if (on_core_notification_) on_core_notification_(incoming_msg);
                                         break;
                                     case NCI_CORE_INTERFACE_ERROR_OID:
                                         ESP_LOGW(TAG, "CORE_INTERFACE_ERROR_RSP Status: 0x%X ConnID: %d",
                                                 incoming_msg.buffer[3], incoming_msg.buffer[4]);
-                                        if (on_core_notification_) on_core_notification_(incoming_msg);
-                                        rf_deactivate(DEACTIVATION_TYPE_DISCOVERY);
                                         break;
                                     case NCI_CORE_CONN_CREDITS_OID:
                                         ESP_LOGD(TAG, "CORE_CONN_CREDITS_RSP received");
-                                        if (on_core_notification_) on_core_notification_(incoming_msg);
                                         break;
                                     default:
                                         ESP_LOGW(TAG, "Unhandled Core Notification OID: 0x%02X", incoming_msg.get_oid());
-                                        if (on_core_notification_) on_core_notification_(incoming_msg);
                                         break;
                                 }
                             } else {
