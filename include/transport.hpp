@@ -29,7 +29,7 @@ public:
      *        Called once before any read/write operations.
      * @return ESP_OK on success.
      */
-    virtual esp_err_t init() = 0;
+    [[nodiscard]] virtual esp_err_t init() = 0;
 
     /**
      * @brief Release all hardware resources acquired during init().
@@ -48,7 +48,7 @@ public:
      * @param length  Number of application-layer bytes to read.
      * @return ESP_OK on success.
      */
-    virtual esp_err_t read(uint8_t* buffer, size_t length) = 0;
+    [[nodiscard]] virtual esp_err_t read(uint8_t* buffer, size_t length) = 0;
 
     /**
      * @brief Write @p length bytes from @p buffer to the device.
@@ -57,7 +57,7 @@ public:
      * @param length  Number of application-layer bytes to write.
      * @return ESP_OK on success.
      */
-    virtual esp_err_t write(const uint8_t* buffer, size_t length) = 0;
+    [[nodiscard]] virtual esp_err_t write(const uint8_t* buffer, size_t length) = 0;
 
     // -------------------------------------------------------------------------
     // IRQ / Data-Ready Signaling
@@ -73,7 +73,7 @@ public:
      *         ESP_ERR_TIMEOUT Timeout elapsed before the line changed.
      *         other           Transport-specific error.
      */
-    virtual esp_err_t wait_for_irq(bool expected_level,
+    [[nodiscard]] virtual esp_err_t wait_for_irq(bool expected_level,
                                    TickType_t timeout_ticks) = 0;
 
     /**

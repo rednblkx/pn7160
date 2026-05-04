@@ -8,7 +8,9 @@
 #include "freertos/projdefs.h"
 
 #include <cstring>
-#include <vector>
+
+// Max application payload (255) + NCI header (3) + SPI TDD (1)
+static constexpr size_t MAX_SPI_TRANSFER = 260;
 
 // ---------------------------------------------------------------------------
 // Constructor / Destructor
@@ -65,16 +67,15 @@ esp_err_t PN7160_SPI::init() {
     }
 
     // --- SPI device ---
-    spi_device_interface_config_t devcfg = {
-        .command_bits  = 0,
-        .address_bits  = 0,
-        .dummy_bits    = 0,
-        .mode          = 0,             // CPOL=0, CPHA=0
-        .clock_speed_hz = clock_hz_,
-        .spics_io_num  = -1,            // Manual CS
-        .flags         = 0,
-        .queue_size    = 3,
-    };
+    spi_device_interface_config_t devcfg = {};
+    devcfg.command_bits   = 0;
+    devcfg.address_bits   = 0;
+    devcfg.dummy_bits     = 0;
+    devcfg.mode           = 0;             // CPOL=0, CPHA=0
+    devcfg.clock_speed_hz = clock_hz_;
+    devcfg.spics_io_num   = -1;            // Manual CS
+    devcfg.flags          = 0;
+    devcfg.queue_size     = 3;
     ESP_RETURN_ON_ERROR(spi_bus_add_device(host_, &devcfg, &device_),
                         TAG, "Failed to add SPI device");
     ESP_LOGI(TAG, "SPI device added at %d MHz", clock_hz_ / 1'000'000);
@@ -119,47 +120,46 @@ void PN7160_SPI::deinit() {
 
 esp_err_t PN7160_SPI::read(uint8_t* buffer, size_t length) {
     if (!buffer || length == 0) return ESP_ERR_INVALID_ARG;
+    if (length + 1 > MAX_SPI_TRANSFER) return ESP_ERR_INVALID_SIZE;
 
     // Full-duplex: transmit TDD_READ + dummy bytes while clocking in data.
     const size_t total = length + 1; // TDD byte + payload
 
-    std::vector<uint8_t> tx(total);
+    alignas(4) uint8_t tx[MAX_SPI_TRANSFER];
+    alignas(4) uint8_t rx[MAX_SPI_TRANSFER];
+
     tx[0] = PN7160_SPI_TDD_READ;
-    memset(tx.data() + 1, 0xFF, length);
+    memset(tx + 1, 0xFF, length);
 
-    std::vector<uint8_t> rx(total);
-
-    spi_transaction_t trans = {
-        .flags     = 0,
-        .length    = total * 8,
-        .rxlength  = total * 8,
-        .tx_buffer = tx.data(),
-        .rx_buffer = rx.data(),
-    };
+    spi_transaction_t trans = {};
+    trans.length    = total * 8;
+    trans.rxlength  = total * 8;
+    trans.tx_buffer = tx;
+    trans.rx_buffer = rx;
 
     ESP_RETURN_ON_ERROR(spi_transfer(&trans), TAG, "SPI read transfer failed");
 
     ESP_LOGD(TAG, "SPI read raw (%zu bytes):", total);
-    ESP_LOG_BUFFER_HEXDUMP(TAG, rx.data(), rx.size(), ESP_LOG_DEBUG);
+    ESP_LOG_BUFFER_HEXDUMP(TAG, rx, total, ESP_LOG_DEBUG);
 
     // Byte 0 received opposite TDD is discarded; bytes 1..N are data.
-    memcpy(buffer, rx.data() + 1, length);
+    memcpy(buffer, rx + 1, length);
     return ESP_OK;
 }
 
 esp_err_t PN7160_SPI::write(const uint8_t* buffer, size_t length) {
     if (!buffer || length == 0) return ESP_ERR_INVALID_ARG;
+    if (length + 1 > MAX_SPI_TRANSFER) return ESP_ERR_INVALID_SIZE;
 
-    std::vector<uint8_t> tx;
-    tx.reserve(length + 1);
-    tx.push_back(PN7160_SPI_TDD_WRITE);
-    tx.insert(tx.end(), buffer, buffer + length);
+    alignas(4) uint8_t tx[MAX_SPI_TRANSFER];
+    tx[0] = PN7160_SPI_TDD_WRITE;
+    memcpy(tx + 1, buffer, length);
 
     spi_transaction_t trans = {
         .flags     = 0,
-        .length    = tx.size() * 8,
+        .length    = (length + 1) * 8,
         .rxlength  = 0,
-        .tx_buffer = tx.data(),
+        .tx_buffer = tx,
         .rx_buffer = nullptr,
     };
 

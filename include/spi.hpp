@@ -49,13 +49,13 @@ public:
                          int clock_mhz = 4);
     ~PN7160_SPI() override;
 
-    esp_err_t init()   override;
-    void      deinit() override;
+    [[nodiscard]] esp_err_t init()   override;
+    void                      deinit() override;
 
-    esp_err_t read(uint8_t* buffer, size_t length) override;
-    esp_err_t write(const uint8_t* buffer, size_t length) override;
+    [[nodiscard]] esp_err_t read(uint8_t* buffer, size_t length) override;
+    [[nodiscard]] esp_err_t write(const uint8_t* buffer, size_t length) override;
 
-    esp_err_t wait_for_irq(bool expected_level,
+    [[nodiscard]] esp_err_t wait_for_irq(bool expected_level,
                            TickType_t timeout_ticks) override;
     bool read_irq_level() const override;
 
@@ -64,16 +64,16 @@ public:
 
 private:
     // --- GPIO helpers ---
-    esp_err_t configure_gpio_output(gpio_num_t pin, bool initial_level,
+    [[nodiscard]] esp_err_t configure_gpio_output(gpio_num_t pin, bool initial_level,
                                     bool pullup = false);
-    esp_err_t configure_gpio_input(gpio_num_t pin);
+    [[nodiscard]] esp_err_t configure_gpio_input(gpio_num_t pin);
     void      chip_select(bool assert); ///< assert=true drives CS low
 
     // --- SPI raw transfer ---
-    esp_err_t spi_transfer(spi_transaction_t* trans);
+    [[nodiscard]] esp_err_t spi_transfer(spi_transaction_t* trans);
 
     // --- IRQ ISR ---
-    esp_err_t setup_irq();
+    [[nodiscard]] esp_err_t setup_irq();
     static void IRAM_ATTR isr_handler(void* arg);
 
     // --- State ---
