@@ -1,15 +1,13 @@
-/* --- pn7160_spi.cpp --- */
-#include "pn7160_spi.hpp"
+#include "pn7160.hpp"
 
-#include "driver/gpio.h"
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_log_buffer.h"
 #include "esp_log_level.h"
-#include "esp_rom_sys.h" // For esp_rom_delay_us
 #include "freertos/idf_additions.h"
 #include "freertos/projdefs.h"
+#include "transport.hpp"
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -43,19 +41,10 @@ static const uint8_t CORE_CONFIG_TOTAL_DURATION_SOLO[] = {
     0x00 // TOTAL_DURATION (high): 1s
 };
 
-static const uint8_t CORE_CONFIG_RW_CE[] = {0x01,   // Number of parameter fields
-    0x00,   // config param identifier (TOTAL_DURATION)
-    0x02,   // length of value
-    0xF8,   // TOTAL_DURATION (low)...
-    0x02};  // TOTAL_DURATION (high): 760 ms
-
 // --- Constructor / Destructor ---
 
-PN7160_SPI::PN7160_SPI(spi_host_device_t host,
-                       const PN7160_SPI_PinConfig& pins, int spi_clock_mhz) :
-    spi_host_(host),
-    pins_(pins),
-    spi_clock_hz_(spi_clock_mhz * 1000 * 1000) {
+PN7160_NCI::PN7160_NCI(IPN7160Transport& transport) :
+    transport(transport) {
     irq_sem_ = xSemaphoreCreateBinary();
     apdu_sync_sem_ = xSemaphoreCreateBinary();
     sync_mutex_ = xSemaphoreCreateMutex();
@@ -67,114 +56,27 @@ PN7160_SPI::PN7160_SPI(spi_host_device_t host,
     }
 }
 
-PN7160_SPI::~PN7160_SPI() {
-    if (spi_device_) {
-        spi_bus_remove_device(spi_device_);
-        ESP_LOGI(TAG, "SPI device removed");
-    }
-
-    if (irq_isr_installed_) {
-        gpio_isr_handler_remove(pins_.irq);
-        ESP_LOGI(TAG, "IRQ handler removed");
-    }
-
-    if (irq_sem_) {
-        vSemaphoreDelete(irq_sem_);
-    }
-
+PN7160_NCI::~PN7160_NCI() {
     if (apdu_sync_sem_) {
         vSemaphoreDelete(apdu_sync_sem_);
     }
     if (sync_mutex_) {
         vSemaphoreDelete(sync_mutex_);
     }
-
-    // Ensure VEN is low if we are destroying the object
-    if (pins_.ven != GPIO_NUM_NC) {
-        gpio_set_level(pins_.ven, 0);
-    }
 }
 
 // --- Initialization ---
 
-esp_err_t PN7160_SPI::initialize() {
-    esp_err_t esp_ret = ESP_OK;
+esp_err_t PN7160_NCI::initialize() {
     esp_err_t nci_status = STATUS_FAILED;
 
-    ESP_LOGI(TAG, "Initializing PN7160 via SPI...");
+    ESP_LOGI(TAG, "Initializing PN7160...");
 
-    // Configure GPIOs
-    // VEN Pin (Output)
-    if (pins_.ven != GPIO_NUM_NC) {
-        gpio_config_t ven_conf = {
-            .pin_bit_mask = (1ULL << pins_.ven),
-            .mode = GPIO_MODE_OUTPUT,
-            .pull_up_en = GPIO_PULLUP_DISABLE,
-            .pull_down_en = GPIO_PULLDOWN_DISABLE,
-            .intr_type = GPIO_INTR_DISABLE,
-        };
-        ESP_RETURN_ON_ERROR(gpio_config(&ven_conf), TAG, "VEN pin config failed");
-        set_ven(false); // Start disabled, core_reset will handle power-up
-    } else {
-        ESP_LOGW(TAG, "VEN pin not configured (GPIO_NUM_NC)");
-    }
-     gpio_config_t cs_conf = {
-        .pin_bit_mask = (1ULL << pins_.cs),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE, // Keep CS high when inactive
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_RETURN_ON_ERROR(gpio_config(&cs_conf), TAG, "CS pin config failed");
-    chip_select(false); // Deselect initially
-
-    // Optional Pins (DWL_REQ, WKUP_REQ) - Configure if used
-    if (pins_.dwl_req != GPIO_NUM_NC) {
-        gpio_config_t dwl_conf = {
-            .pin_bit_mask = (1ULL << pins_.dwl_req),
-            .mode = GPIO_MODE_OUTPUT,
-            .pull_up_en = GPIO_PULLUP_DISABLE,
-            .pull_down_en = GPIO_PULLDOWN_DISABLE,
-            .intr_type = GPIO_INTR_DISABLE,
-        };
-        ESP_RETURN_ON_ERROR(gpio_config(&dwl_conf), TAG,
-                            "DWL_REQ pin config failed");
-        gpio_set_level(pins_.dwl_req, 0); // Default low
-    }
-    if (pins_.wkup_req != GPIO_NUM_NC) {
-        gpio_config_t wkup_conf = {
-            .pin_bit_mask = (1ULL << pins_.wkup_req),
-            .mode = GPIO_MODE_OUTPUT,
-            .pull_up_en = GPIO_PULLUP_DISABLE,
-            .pull_down_en = GPIO_PULLDOWN_DISABLE,
-            .intr_type = GPIO_INTR_DISABLE,
-        };
-        ESP_RETURN_ON_ERROR(gpio_config(&wkup_conf), TAG,
-                            "WKUP_REQ pin config failed");
-        gpio_set_level(pins_.wkup_req, 0); // Default low
-    }
-
-    spi_device_interface_config_t devcfg = {
-        .command_bits = 0,
-        .address_bits = 0,
-        .dummy_bits = 0,
-        .mode = 0, // SPI mode 0 (CPOL=0, CPHA=0) - PN7160 supports all modes
-        .clock_speed_hz = spi_clock_hz_,
-        .spics_io_num = -1, // Manual CS control
-        .flags = 0,
-        .queue_size = 3, // Allow 3 transactions in flight
-    };
-    esp_ret = spi_bus_add_device(spi_host_, &devcfg, &spi_device_);
-    ESP_RETURN_ON_ERROR(esp_ret, TAG, "Failed to add SPI device");
-    ESP_LOGI(TAG, "SPI device added");
-
-    // Setup IRQ Pin and ISR (Moved before Reset)
-    ESP_RETURN_ON_ERROR(setup_irq(), TAG, "IRQ setup failed");
-    ESP_LOGI(TAG, "IRQ setup complete");
+    transport.init();
 
     // NCI Core Reset
     // Reset config=true, power_cycle=true (if VEN available)
-    nci_status = core_reset(true, (pins_.ven != GPIO_NUM_NC));
+    nci_status = core_reset(true);
     if (nci_status != STATUS_OK) {
         ESP_LOGE(TAG, "NCI Core Reset command failed (NCI Status=0x%X)", nci_status);
         spi_bus_remove_device(spi_device_);
@@ -292,213 +194,35 @@ esp_err_t PN7160_SPI::initialize() {
 
 // --- Hardware Control ---
 
-void PN7160_SPI::set_ven(bool enable) {
-    if (pins_.ven != GPIO_NUM_NC) {
-        gpio_set_level(pins_.ven, enable ? 1 : 0);
-        ESP_LOGD(TAG, "VEN set to %d", enable);
-    }
-}
-
-void PN7160_SPI::chip_select(bool select) {
-    gpio_set_level(pins_.cs, select ? 0 : 1); // Active low CS
-}
-
-esp_err_t PN7160_SPI::hardware_reset() {
-    if (pins_.ven == GPIO_NUM_NC) {
+esp_err_t PN7160_NCI::hardware_reset() {
+    if (transport.has_ven()) {
         ESP_LOGE(TAG, "Cannot perform hardware reset, VEN pin not configured");
         return ESP_ERR_INVALID_STATE;
     }
     ESP_LOGD(TAG, "Performing hardware reset...");
-    set_ven(true);
+    transport.set_ven(true);
     vTaskDelay(pdMS_TO_TICKS(10)); // Reset pulse width (min 10ms UM11495?)
-    set_ven(false);
+    transport.set_ven(false);
     vTaskDelay(pdMS_TO_TICKS(10)); // Reset pulse width (min 10ms UM11495?)
-    set_ven(true);
+    transport.set_ven(true);
     vTaskDelay(pdMS_TO_TICKS(
         PN7160_INIT_TIMEOUT_MS)); // Wait for chip to boot (UM11495 Tboot=5ms)
     ESP_LOGD(TAG, "Hardware reset complete.");
     return ESP_OK;
 }
 
-// --- IRQ Handling ---
-
-esp_err_t PN7160_SPI::setup_irq() {
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << pins_.irq),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE, // External pull-down usually present
-        .pull_down_en = GPIO_PULLDOWN_DISABLE, // Or enable if needed
-        .intr_type = GPIO_INTR_POSEDGE, // Trigger on rising edge (IRQ active high)
-    };
-    ESP_RETURN_ON_ERROR(gpio_config(&io_conf), TAG, "IRQ pin config failed");
-
-    esp_err_t ret = gpio_install_isr_service(ESP_INTR_FLAG_LEVEL1);
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) { // ESP_ERR_INVALID_STATE means already installed
-        ESP_RETURN_ON_ERROR(ret, TAG, "Failed to install GPIO ISR service");
-    } else if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "GPIO ISR service installed");
-    } else {
-        ESP_LOGW(TAG, "GPIO ISR service was already installed");
-    }
-
-    // Add ISR handler for the specific pin
-    ret = gpio_isr_handler_add(pins_.irq, gpio_isr_handler, (void*)this);
-    ESP_RETURN_ON_ERROR(ret, TAG, "Failed to add ISR handler for IRQ pin");
-
-    irq_isr_installed_ = true;
-    ESP_LOGI(TAG, "IRQ handler setup complete for GPIO %d", pins_.irq);
-    return ESP_OK;
-}
-
-void IRAM_ATTR PN7160_SPI::gpio_isr_handler(void* arg) {
-    PN7160_SPI* driver = static_cast<PN7160_SPI*>(arg);
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-
-    // Give the semaphore - signals that IRQ line is HIGH (data ready)
-    xSemaphoreGiveFromISR(driver->irq_sem_, &xHigherPriorityTaskWoken);
-
-    // Request context switch if a higher priority task was woken
-    if (xHigherPriorityTaskWoken == pdTRUE) {
-        portYIELD_FROM_ISR();
-    }
-}
-
-esp_err_t PN7160_SPI::wait_for_irq(bool expected_state,
-                                   TickType_t timeout_ticks) {
-    if (gpio_get_level(pins_.irq) == expected_state) {
-        return ESP_OK;
-    }
-
-    // If expecting LOW, we just check, we don't wait using the semaphore
-    // as the semaphore signals HIGH.
-    if (!expected_state) {
-        ESP_LOGW(TAG, "Waited for IRQ LOW, but it's HIGH.");
-        return ESP_ERR_INVALID_STATE; // Or maybe timeout?
-    }
-
-    // Expecting HIGH: Wait for the semaphore triggered by the ISR (rising edge)
-    // Clear any pending semaphore count before waiting
-    xSemaphoreTake(irq_sem_, 0);
-
-    if (xSemaphoreTake(irq_sem_, timeout_ticks) == pdTRUE) {
-        // Semaphore received, IRQ should be high
-        if (gpio_get_level(pins_.irq) == expected_state) {
-            return ESP_OK; // Correct state reached
-        } else {
-            // This shouldn't happen if ISR triggers on rising edge and gives sema
-            ESP_LOGW(TAG, "IRQ semaphore received, but pin state is LOW?");
-            return ESP_FAIL; // Unexpected state
-        }
-    } else {
-        // Timeout occurred
-        // ESP_LOGW(TAG, "Timeout waiting for IRQ HIGH");
-        // Check the state again in case the interrupt happened just after timeout
-        if (gpio_get_level(pins_.irq) == expected_state) {
-             ESP_LOGW(TAG, "IRQ became HIGH right after timeout check");
-             return ESP_OK;
-        }
-        return ESP_ERR_TIMEOUT;
-    }
-}
-
-// --- SPI Communication ---
-
-esp_err_t PN7160_SPI::spi_transfer(spi_transaction_t* trans) {
-    // Add small delays around CS based on observation/best practice
-    esp_rom_delay_us(5); // Delay before CS assert
-    chip_select(true); // Assert CS (Active Low)
-    esp_rom_delay_us(5); // Delay after CS assert, before clocking
-
-    esp_err_t ret = spi_device_polling_transmit(spi_device_, trans);
-
-    esp_rom_delay_us(5); // Delay after clocking, before CS deassert
-    chip_select(false); // Deassert CS
-    esp_rom_delay_us(5); // Delay after CS deassert
-
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "SPI transfer failed (err=0x%X)", ret);
-    }
-    return ret;
-}
-
-esp_err_t PN7160_SPI::spi_read(uint8_t* buffer, size_t length) {
-    if (!buffer || length == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    // --- Full-Duplex Transaction Setup ---
-    // We need to send TDD byte + dummy bytes while receiving data.
-    size_t total_transfer_len = length + 1; // TDD byte + Data bytes
-
-    // Prepare TX buffer: TDD byte followed by dummy bytes
-    std::vector<uint8_t> tx_buf(total_transfer_len);
-    tx_buf[0] = PN7160_SPI_READ_TDD;
-    memset(tx_buf.data() + 1, 0xFF, length); // Use 0xFF for dummy bytes
-
-    // Prepare RX buffer
-    std::vector<uint8_t> rx_buf(total_transfer_len);
-
-    spi_transaction_t trans = {
-        .flags = 0,
-        .length = total_transfer_len * 8, // Total bits to transmit
-        .rxlength = total_transfer_len * 8, // Total bits to receive
-        .tx_buffer = tx_buf.data(), // Transmit TDD + dummy bytes
-        .rx_buffer = rx_buf.data() // Receive into this buffer
-    };
-
-    esp_err_t ret = spi_transfer(&trans);
-
-    if (ret == ESP_OK) {
-        ESP_LOGD(TAG, "Raw SPI Read (%zu bytes received):", total_transfer_len);
-        ESP_LOG_BUFFER_HEXDUMP(TAG, rx_buf.data(), rx_buf.size(), ESP_LOG_DEBUG);
-        // Copy relevant part (skip first byte received opposite TDD)
-        memcpy(buffer, rx_buf.data() + 1, length);
-    } else {
-        ESP_LOGE(TAG, "SPI read transfer failed with error 0x%X", ret);
-    }
-
-    // IRQ should go low during/after the transfer automatically.
-    // No need to explicitly wait for IRQ low here.
-
-    return ret;
-}
-
-esp_err_t PN7160_SPI::spi_write(const uint8_t* buffer, size_t length) {
-    if (!buffer || length == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    // Need temporary buffer to prepend TDD byte
-    std::vector<uint8_t> write_buf;
-    write_buf.reserve(length + 1);
-    write_buf.push_back(PN7160_SPI_WRITE_TDD);
-    write_buf.insert(write_buf.end(), buffer, buffer + length);
-
-    spi_transaction_t trans = {
-        .flags = 0,
-        .length = write_buf.size() * 8, // Total length in bits
-        .rxlength = 0, // No reception during write
-        .tx_buffer = write_buf.data(),
-        .rx_buffer = nullptr,
-    };
-
-    // After a write, IRQ might go high later indicating a response.
-    // The caller (e.g., send_command_wait_response) handles waiting for IRQ.
-    return spi_transfer(&trans);
-}
-
 // --- NCI Packet Read/Write ---
 
-esp_err_t PN7160_SPI::read_nci_packet(NciMessage& msg, uint32_t timeout_ms) {
+esp_err_t PN7160_NCI::read_nci_packet(NciMessage& msg, uint32_t timeout_ms) {
     msg.clear();
     uint8_t header[NCI_HEADER_SIZE];
     uint8_t payload_len = 0;
 
     // Wait for IRQ high (indicates data available)
-    esp_err_t ret = wait_for_irq(true, pdMS_TO_TICKS(timeout_ms));
+    esp_err_t ret = transport.wait_for_irq(true, pdMS_TO_TICKS(timeout_ms));
     if (ret != ESP_OK) {
         // Check level again in case it went high just after timeout
-        if (gpio_get_level(pins_.irq)) {
+        if (transport.read_irq_level()) {
              ESP_LOGW(TAG, "IRQ became HIGH right after timeout check in read_nci_packet");
              // Proceed to read attempt
         } else {
@@ -509,7 +233,7 @@ esp_err_t PN7160_SPI::read_nci_packet(NciMessage& msg, uint32_t timeout_ms) {
 
 
     // Read NCI Header (3 bytes)
-    ESP_RETURN_ON_ERROR(spi_read(header, NCI_HEADER_SIZE), TAG,
+    ESP_RETURN_ON_ERROR(transport.read(header, NCI_HEADER_SIZE), TAG,
                         "Failed to read NCI header");
 
     // Parse header and get payload length
@@ -531,7 +255,7 @@ esp_err_t PN7160_SPI::read_nci_packet(NciMessage& msg, uint32_t timeout_ms) {
         size_t current_size = msg.buffer.size();
         msg.buffer.resize(current_size + payload_len);
         ESP_RETURN_ON_ERROR(
-            spi_read(msg.data() + current_size, payload_len), TAG,
+            transport.read(msg.data() + current_size, payload_len), TAG,
             "Failed to read NCI payload");
     }
 
@@ -541,19 +265,19 @@ esp_err_t PN7160_SPI::read_nci_packet(NciMessage& msg, uint32_t timeout_ms) {
     return ESP_OK;
 }
 
-esp_err_t PN7160_SPI::write_nci_packet(const NciMessage& msg) {
+esp_err_t PN7160_NCI::write_nci_packet(const NciMessage& msg) {
     if (msg.size() == 0 || msg.size() > NCI_MAX_PACKET_SIZE) {
         return ESP_ERR_INVALID_ARG;
     }
     ESP_LOGD(TAG, "Write NCI Packet (Size: %zu):", msg.size());
     ESP_LOG_BUFFER_HEXDUMP(TAG, msg.data(), msg.size(), ESP_LOG_DEBUG);
-    return spi_write(msg.data(), msg.size());
+    return transport.write(msg.data(), msg.size());
 }
 
 // --- NCI Command / Response ---
 
 // Returns NCI Status Code or ESP error code
-esp_err_t PN7160_SPI::send_command_wait_response(NciMessage& cmd,
+esp_err_t PN7160_NCI::send_command_wait_response(NciMessage& cmd,
                                                  NciMessage& rsp,
                                                  uint32_t timeout_ms) {
     // Allow Reset/Init even if not marked initialized yet
@@ -604,7 +328,7 @@ esp_err_t PN7160_SPI::send_command_wait_response(NciMessage& cmd,
     return rsp.get_status(); // NCI status code, 0x00 is STATUS_OK
 }
 
-esp_err_t PN7160_SPI::send_data_packet(const NciMessage& data_pkt) {
+esp_err_t PN7160_NCI::send_data_packet(const NciMessage& data_pkt) {
     if (data_pkt.get_mt() != NCI_PKT_MT_DATA) {
         ESP_LOGE(TAG, "Message is not an NCI Data packet (MT=%d)",
                  data_pkt.get_mt());
@@ -632,7 +356,7 @@ esp_err_t PN7160_SPI::send_data_packet(const NciMessage& data_pkt) {
  *                   ESP_ERR_INVALID_STATE if driver not initialized or another sync operation is running,
  *                   ESP_FAIL or other ESP errors on communication failure.
  */
-esp_err_t PN7160_SPI::send_apdu_sync(const std::vector<uint8_t> &c_apdu,
+esp_err_t PN7160_NCI::send_apdu_sync(const std::vector<uint8_t> &c_apdu,
                                      std::vector<uint8_t> &r_apdu,
                                      uint32_t timeout_ms) {
   if (!initialized_) {
@@ -728,26 +452,20 @@ esp_err_t PN7160_SPI::send_apdu_sync(const std::vector<uint8_t> &c_apdu,
 }
 
 // Returns NCI Status Code
-esp_err_t PN7160_SPI::core_reset(bool reset_config, bool power_cycle) {
-    // *** Perform power cycle first if requested ***
-    if (power_cycle) {
-        if (pins_.ven == GPIO_NUM_NC) {
-            ESP_LOGE(TAG, "Cannot perform power cycle reset, VEN pin not configured");
-            return ESP_ERR_INVALID_STATE;
-        }
-        ESP_LOGD(TAG, "Performing power cycle reset...");
-        set_ven(false);
-        vTaskDelay(pdMS_TO_TICKS(PN7160_DEFAULT_TIMEOUT_MS)); // Reset pulse width
-        set_ven(true);
-        vTaskDelay(pdMS_TO_TICKS(PN7160_DEFAULT_TIMEOUT_MS)); // Wait for boot
-        ESP_LOGD(TAG, "Power cycle reset complete.");
-
-        // Optional: Clear potential initial IRQ high after power cycle
-        if (gpio_get_level(pins_.irq)) {
-            ESP_LOGW(TAG, "IRQ high after power cycle, clearing pending message");
-            NciMessage dummy_msg;
-            read_nci_packet(dummy_msg, 50);
-        }
+esp_err_t PN7160_NCI::core_reset(bool reset_config) {
+    if(transport.has_ven()){
+      // *** Perform power cycle first if requested ***
+      transport.set_ven(false);
+      vTaskDelay(pdMS_TO_TICKS(PN7160_DEFAULT_TIMEOUT_MS)); // Reset pulse width
+      transport.set_ven(true);
+      vTaskDelay(pdMS_TO_TICKS(PN7160_DEFAULT_TIMEOUT_MS)); // Wait for boot
+      ESP_LOGD(TAG, "Power cycle reset complete.");
+    }
+    // Optional: Clear potential initial IRQ high after power cycle
+    if (transport.read_irq_level()) {
+        ESP_LOGW(TAG, "IRQ high after power cycle, clearing pending message");
+        NciMessage dummy_msg;
+        read_nci_packet(dummy_msg, 50);
     }
 
     // NCI 2.0 Sequence: CMD -> RSP -> NTF
@@ -830,7 +548,7 @@ esp_err_t PN7160_SPI::core_reset(bool reset_config, bool power_cycle) {
 }
 
 // Returns NCI Status Code
-esp_err_t PN7160_SPI::core_init() {
+esp_err_t PN7160_NCI::core_init() {
     NciMessage cmd(NCI_PKT_MT_CTRL_COMMAND, NCI_CORE_GID, NCI_CORE_INIT_OID);
     NciMessage rsp;
     // Core Init response contains chip info, might be longer
@@ -867,7 +585,7 @@ esp_err_t PN7160_SPI::core_init() {
 }
 
 // Returns NCI Status Code
-esp_err_t PN7160_SPI::core_set_config(
+esp_err_t PN7160_NCI::core_set_config(
     const std::vector<uint8_t>& config_params) {
     NciMessage cmd(NCI_PKT_MT_CTRL_COMMAND, NCI_CORE_GID,
                    NCI_CORE_SET_CONFIG_OID, config_params);
@@ -907,7 +625,7 @@ esp_err_t PN7160_SPI::core_set_config(
 }
 
 // Returns NCI Status Code
-esp_err_t PN7160_SPI::rf_discover_map(
+esp_err_t PN7160_NCI::rf_discover_map(
     const std::vector<uint8_t>& mappings) {
     NciMessage cmd(NCI_PKT_MT_CTRL_COMMAND, RF_GID, RF_DISCOVER_MAP_OID,
                    mappings);
@@ -932,7 +650,7 @@ esp_err_t PN7160_SPI::rf_discover_map(
 }
 
 // Returns NCI Status Code
-esp_err_t PN7160_SPI::rf_set_listen_mode_routing(
+esp_err_t PN7160_NCI::rf_set_listen_mode_routing(
     const std::vector<uint8_t>& routing_config) {
     NciMessage cmd(NCI_PKT_MT_CTRL_COMMAND, RF_GID,
                    RF_SET_LISTEN_MODE_ROUTING_OID, routing_config);
@@ -957,7 +675,7 @@ esp_err_t PN7160_SPI::rf_set_listen_mode_routing(
 }
 
 // Returns NCI Status Code
-esp_err_t PN7160_SPI::rf_start_discovery(
+esp_err_t PN7160_NCI::rf_start_discovery(
     const std::vector<uint8_t>& discovery_config) {
     NciMessage cmd(NCI_PKT_MT_CTRL_COMMAND, RF_GID, RF_DISCOVER_OID,
                    discovery_config);
@@ -982,13 +700,13 @@ esp_err_t PN7160_SPI::rf_start_discovery(
 }
 
 // Returns NCI Status Code
-esp_err_t PN7160_SPI::rf_stop_discovery() {
+esp_err_t PN7160_NCI::rf_stop_discovery() {
     // Deactivate to IDLE state to stop discovery
     return rf_deactivate(DEACTIVATION_TYPE_IDLE);
 }
 
 // Returns NCI Status Code
-esp_err_t PN7160_SPI::rf_select_target(uint8_t discovery_id, uint8_t protocol,
+esp_err_t PN7160_NCI::rf_select_target(uint8_t discovery_id, uint8_t protocol,
                                        uint8_t interface) {
     NciMessage cmd(NCI_PKT_MT_CTRL_COMMAND, RF_GID, RF_DISCOVER_SELECT_OID,
                    {discovery_id, protocol, interface});
@@ -1015,7 +733,7 @@ esp_err_t PN7160_SPI::rf_select_target(uint8_t discovery_id, uint8_t protocol,
 
 // Returns NCI Status Code (STATUS_OK if RSP is OK, error otherwise)
 // Note: This function waits for the NTF as well for completion.
-esp_err_t PN7160_SPI::rf_deactivate(uint8_t type) {
+esp_err_t PN7160_NCI::rf_deactivate(uint8_t type) {
     NciMessage cmd(NCI_PKT_MT_CTRL_COMMAND, RF_GID, RF_DEACTIVATE_OID, {type});
     NciMessage rsp;
     NciMessage ntf;
@@ -1061,7 +779,7 @@ esp_err_t PN7160_SPI::rf_deactivate(uint8_t type) {
     return STATUS_OK; // Return OK as both RSP and NTF were handled
 }
 
-esp_err_t PN7160_SPI::rf_iso_dep_presence_check() {
+esp_err_t PN7160_NCI::rf_iso_dep_presence_check() {
     if (!initialized_) return ESP_ERR_INVALID_STATE;
 
     NciMessage cmd(NCI_PKT_MT_CTRL_COMMAND, RF_GID, RF_ISO_DEP_NAK_PRESENCE_OID);
@@ -1079,7 +797,7 @@ esp_err_t PN7160_SPI::rf_iso_dep_presence_check() {
 
 // --- Task Runner ---
 
-void PN7160_SPI::task_runner() {
+void PN7160_NCI::task_runner() {
     if (!initialized_) {
         ESP_LOGE(TAG, "Task runner started but driver not initialized!");
         vTaskDelete(NULL);
@@ -1091,7 +809,7 @@ void PN7160_SPI::task_runner() {
     NciMessage incoming_msg;
     esp_err_t ret = 0; 
     while (true) {
-        if (wait_for_irq(true, portMAX_DELAY) == ESP_OK) {
+        if (transport.wait_for_irq(true, portMAX_DELAY) == ESP_OK) {
             ret = read_nci_packet(incoming_msg, PN7160_DEFAULT_TIMEOUT_MS);
 
             if (ret == ESP_OK) {

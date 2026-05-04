@@ -1,11 +1,10 @@
-/* --- pn7160_spi.hpp --- */
 #pragma once
 
 #include "driver/spi_master.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "soc/gpio_num.h"
+#include "transport.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -142,19 +141,6 @@ static const size_t NCI_HEADER_SIZE = 3;
 static const size_t NCI_MAX_PAYLOAD_SIZE = 255;
 static const size_t NCI_MAX_PACKET_SIZE = NCI_HEADER_SIZE + NCI_MAX_PAYLOAD_SIZE;
 
-// --- Configuration Structures ---
-struct PN7160_SPI_PinConfig {
-    gpio_num_t miso;
-    gpio_num_t mosi;
-    gpio_num_t sclk;
-    gpio_num_t cs;
-    gpio_num_t irq;
-    gpio_num_t ven; // VEN/ENABLE pin
-    // Optional pins (set to GPIO_NUM_NC if not used)
-    gpio_num_t dwl_req = GPIO_NUM_NC;
-    gpio_num_t wkup_req = GPIO_NUM_NC;
-};
-
 // --- NCI Message Wrapper ---
 class NciMessage {
 public:
@@ -236,7 +222,7 @@ public:
 };
 
 // --- Main Driver Class ---
-class PN7160_SPI {
+class PN7160_NCI {
 public:
     // --- Callbacks ---
     using RfInterfaceActivatedCallback = std::function<void(const NciMessage&)>;
@@ -245,19 +231,15 @@ public:
     using CoreNotificationCallback = std::function<void(const NciMessage&)>;
     using DataPacketCallback = std::function<void(const NciMessage&)>;
 
-    PN7160_SPI(spi_host_device_t host, const PN7160_SPI_PinConfig& pins,
-               int spi_clock_mhz = 4);
-    ~PN7160_SPI();
+    PN7160_NCI(IPN7160Transport& transport);
+    ~PN7160_NCI();
 
     // Initialization sequence
     // Returns ESP_OK on success, ESP_FAIL or other ESP error codes on failure.
     esp_err_t initialize();
 
     // NCI Commands (High Level)
-    // These functions return NCI Status Codes (e.g., STATUS_OK, STATUS_FAILED)
-    // cast to esp_err_t for convenience with ESP_RETURN_ON_ERROR.
-    // Check return value against STATUS_OK (0x00) for success.
-    esp_err_t core_reset(bool reset_config, bool power_cycle);
+    esp_err_t core_reset(bool reset_config);
     esp_err_t core_init();
     esp_err_t core_set_config(const std::vector<uint8_t>& config_params);
     esp_err_t rf_discover_map(const std::vector<uint8_t>& mappings);
@@ -304,28 +286,16 @@ public:
     void task_runner();
 
 private:
-    // Low-level SPI communication
-    esp_err_t spi_read(uint8_t* buffer, size_t length);
-    esp_err_t spi_write(const uint8_t* buffer, size_t length);
-    esp_err_t spi_transfer(spi_transaction_t* trans);
-
     // NCI Packet Read/Write
     esp_err_t read_nci_packet(NciMessage& msg, uint32_t timeout_ms);
     esp_err_t write_nci_packet(const NciMessage& msg);
 
-    // IRQ Handling
-    esp_err_t setup_irq();
-    esp_err_t wait_for_irq(bool expected_state, TickType_t timeout_ticks);
-    static void IRAM_ATTR gpio_isr_handler(void* arg);
-
     // Hardware Control
     esp_err_t hardware_reset(); // Toggles VEN pin
-    void set_ven(bool enable);
-    void chip_select(bool select);
 
     // Internal state/config
     spi_host_device_t spi_host_;
-    PN7160_SPI_PinConfig pins_;
+    IPN7160Transport& transport;
     int spi_clock_hz_;
     spi_device_handle_t spi_device_ = nullptr;
     SemaphoreHandle_t irq_sem_ = nullptr;
@@ -348,5 +318,5 @@ private:
     CoreNotificationCallback on_core_notification_;
     DataPacketCallback on_data_packet_;
 
-    const char* TAG = "PN7160_SPI"; // Logging tag
+    const char* TAG = "PN7160_NCI"; // Logging tag
 };
