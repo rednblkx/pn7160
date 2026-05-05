@@ -13,6 +13,9 @@
 static constexpr uint8_t PN7160_SPI_TDD_READ  = 0xFF;
 static constexpr uint8_t PN7160_SPI_TDD_WRITE = 0x0A;
 
+// Max application payload (255) + NCI header (3) + SPI TDD (1)
+static constexpr size_t MAX_SPI_TRANSFER = 260;
+
 /**
  * @brief Pin assignment for the SPI transport.
  *
@@ -66,7 +69,6 @@ private:
     // --- GPIO helpers ---
     [[nodiscard]] esp_err_t configure_gpio_output(gpio_num_t pin, bool initial_level,
                                     bool pullup = false);
-    [[nodiscard]] esp_err_t configure_gpio_input(gpio_num_t pin);
     void      chip_select(bool assert); ///< assert=true drives CS low
 
     // --- SPI raw transfer ---
@@ -82,8 +84,15 @@ private:
     int                  clock_hz_;
     spi_device_handle_t  device_       = nullptr;
     SemaphoreHandle_t    irq_sem_      = nullptr;
+    SemaphoreHandle_t    spi_mutex_    = nullptr;
     bool                 isr_installed_ = false;
     bool                 initialized_  = false;
+    bool                 bus_initialized_ = false;
+
+    // DMA-aligned transfer buffers (heap-allocated as class members to
+    // avoid blowing the 4 KiB FreeRTOS task stack with 520-byte locals).
+    alignas(4) uint8_t   tx_buf_[MAX_SPI_TRANSFER];
+    alignas(4) uint8_t   rx_buf_[MAX_SPI_TRANSFER];
 
     static constexpr const char* TAG = "PN7160_SPI";
 };

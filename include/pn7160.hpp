@@ -6,6 +6,7 @@
 #include "freertos/task.h"
 #include "transport.hpp"
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <vector>
@@ -13,10 +14,6 @@
 
 // --- NCI Constants (NCI Core Spec v2.0 & PN7160 UM11495) ---
 namespace nci {
-
-// Distinct type alias for NCI status codes to clarify intent
-// where they are mixed with esp_err_t return values.
-using status_t = uint8_t;
 
 // Message Types (MT)
 inline constexpr uint8_t PKT_MT_DATA = 0x00;
@@ -141,8 +138,6 @@ inline constexpr uint8_t INTF_TAGCMD = 0x80; // Proprietary (PN7160 UM Table 18)
 inline constexpr uint16_t PN7160_DEFAULT_TIMEOUT_MS = 10;
 inline constexpr uint16_t PN7160_INIT_TIMEOUT_MS = 500;
 inline constexpr uint16_t PN7160_IRQ_TIMEOUT_MS = 250;
-inline constexpr uint8_t PN7160_SPI_READ_TDD = 0xFF;  // UM11495 Table 7
-inline constexpr uint8_t PN7160_SPI_WRITE_TDD = 0x0A; // UM11495 Table 7
 inline constexpr size_t NCI_HEADER_SIZE = 3;
 inline constexpr size_t NCI_MAX_PAYLOAD_SIZE = 255;
 inline constexpr size_t NCI_MAX_PACKET_SIZE = NCI_HEADER_SIZE + NCI_MAX_PAYLOAD_SIZE;
@@ -152,9 +147,7 @@ inline constexpr size_t NCI_MAX_PACKET_SIZE = NCI_HEADER_SIZE + NCI_MAX_PAYLOAD_
 // --- NCI Message Wrapper ---
 class NciMessage {
 public:
-    NciMessage(size_t initial_size = nci::NCI_HEADER_SIZE) {
-        buffer_.reserve(initial_size);
-    }
+    NciMessage() = default;
 
     NciMessage(uint8_t mt, uint8_t gid, uint8_t oid,
                const std::vector<uint8_t>& payload = {}) {
@@ -163,45 +156,54 @@ public:
 
     void build(uint8_t mt, uint8_t gid, uint8_t oid,
                const std::vector<uint8_t>& payload = {}) {
-        buffer_.clear();
-        // MT (3 bits), PBF (1 bit), GID (4 bits)
-        buffer_.push_back((mt << 5) | (gid & 0x0F)); // PBF is always 0 for CMD/RSP/NTF
-        buffer_.push_back(oid & 0x3F);                 // OID (6 bits)
-        buffer_.push_back(static_cast<uint8_t>(payload.size())); // Length
-        buffer_.insert(buffer_.end(), payload.begin(), payload.end());
+        len_ = nci::NCI_HEADER_SIZE;
+        buffer_[0] = (mt << 5) | (gid & 0x0F); // PBF is always 0 for CMD/RSP/NTF
+        buffer_[1] = oid & 0x3F;
+        size_t plen = (payload.size() > nci::NCI_MAX_PAYLOAD_SIZE)
+                          ? nci::NCI_MAX_PAYLOAD_SIZE
+                          : payload.size();
+        buffer_[2] = static_cast<uint8_t>(plen);
+        for (size_t i = 0; i < plen; ++i) {
+            buffer_[nci::NCI_HEADER_SIZE + i] = payload[i];
+        }
+        len_ += plen;
     }
 
     // Method to build a data packet (ConnID 0 for Static RF Connection)
     void build_data(const std::vector<uint8_t>& payload, uint8_t conn_id = 0, bool last_segment = true) {
-        buffer_.clear();
+        len_ = nci::NCI_HEADER_SIZE;
         uint8_t pbf = last_segment ? 0 : 1; // Packet Boundary Flag
-        // MT (3 bits=0), PBF (1 bit), ConnID (4 bits)
-        buffer_.push_back((nci::PKT_MT_DATA << 5) | (pbf << 4) | (conn_id & 0x0F));
-        buffer_.push_back(0); // RFU / OID placeholder for data
-        buffer_.push_back(static_cast<uint8_t>(payload.size())); // Length
-        buffer_.insert(buffer_.end(), payload.begin(), payload.end());
+        buffer_[0] = (nci::PKT_MT_DATA << 5) | (pbf << 4) | (conn_id & 0x0F);
+        buffer_[1] = 0; // RFU / OID placeholder for data
+        size_t plen = (payload.size() > nci::NCI_MAX_PAYLOAD_SIZE)
+                          ? nci::NCI_MAX_PAYLOAD_SIZE
+                          : payload.size();
+        buffer_[2] = static_cast<uint8_t>(plen);
+        for (size_t i = 0; i < plen; ++i) {
+            buffer_[nci::NCI_HEADER_SIZE + i] = payload[i];
+        }
+        len_ += plen;
     }
 
-    uint8_t get_mt() const { return (buffer_.size() > 0) ? (buffer_[0] >> 5) : 0; }
-    uint8_t get_pbf() const { return (buffer_.size() > 0) ? ((buffer_[0] >> 4) & 0x01) : 0; }
-    uint8_t get_gid() const { return (buffer_.size() > 0) ? (buffer_[0] & 0x0F) : 0; }
-    uint8_t get_oid() const { return (buffer_.size() > 1) ? (buffer_[1] & 0x3F) : 0; }
-    uint8_t get_len() const { return (buffer_.size() > 2) ? buffer_[2] : 0; }
+    uint8_t get_mt() const { return (len_ > 0) ? (buffer_[0] >> 5) : 0; }
+    uint8_t get_pbf() const { return (len_ > 0) ? ((buffer_[0] >> 4) & 0x01) : 0; }
+    uint8_t get_gid() const { return (len_ > 0) ? (buffer_[0] & 0x0F) : 0; }
+    uint8_t get_oid() const { return (len_ > 1) ? (buffer_[1] & 0x3F) : 0; }
+    uint8_t get_len() const { return (len_ > 2) ? buffer_[2] : 0; }
 
     // Status is typically the first byte of the payload for RSP/NTF
     uint8_t get_status() const {
-        return (buffer_.size() > 3 && get_len() > 0) ? buffer_[3] : nci::STATUS_FAILED;
+        return (len_ > 3 && get_len() > 0) ? buffer_[3] : nci::STATUS_FAILED;
     }
 
     const uint8_t* get_payload_ptr() const {
-        return (buffer_.size() > nci::NCI_HEADER_SIZE) ? buffer_.data() + nci::NCI_HEADER_SIZE
-                                                        : nullptr;
+        return buffer_.data() + nci::NCI_HEADER_SIZE;
     }
 
     std::vector<uint8_t> get_payload_copy() const {
-        if (buffer_.size() > nci::NCI_HEADER_SIZE) {
+        if (len_ > nci::NCI_HEADER_SIZE) {
             return std::vector<uint8_t>(buffer_.begin() + nci::NCI_HEADER_SIZE,
-                                        buffer_.end());
+                                        buffer_.begin() + len_);
         }
         return {};
     }
@@ -222,36 +224,38 @@ public:
         return true;
     }
 
-    void clear() { buffer_.clear(); }
-    size_t size() const { return buffer_.size(); }
-    uint8_t* data() { return buffer_.data(); }
+    void clear() { len_ = 0; }
+    size_t size() const { return len_; }
+    uint8_t* data() { return &buffer_[0]; }
     const uint8_t* data() const { return buffer_.data(); }
 
-    // Safe indexed access (read-only for const, bounds-checked for non-const)
+    // Safe indexed access (read-only, bounds-checked)
     uint8_t operator[](size_t idx) const {
-        return (idx < buffer_.size()) ? buffer_[idx] : 0;
+        return (idx < len_) ? buffer_[idx] : 0;
     }
 
-    uint8_t at(size_t idx) const {
-        return (idx < buffer_.size()) ? buffer_[idx] : 0;
+    bool empty() const { return len_ == 0; }
+
+    void push_back(uint8_t byte) {
+        if (len_ < nci::NCI_MAX_PACKET_SIZE) {
+            buffer_[len_++] = byte;
+        }
     }
 
-    bool empty() const { return buffer_.empty(); }
-
-    void push_back(uint8_t byte) { buffer_.push_back(byte); }
-
-    void resize(size_t n) { buffer_.resize(n); }
+    void resize(size_t n) {
+        len_ = (n > nci::NCI_MAX_PACKET_SIZE) ? nci::NCI_MAX_PACKET_SIZE : n;
+    }
 
     void assign(const uint8_t* begin, const uint8_t* end) {
-        buffer_.assign(begin, end);
+        size_t n = static_cast<size_t>(end - begin);
+        if (n > nci::NCI_MAX_PACKET_SIZE) n = nci::NCI_MAX_PACKET_SIZE;
+        for (size_t i = 0; i < n; ++i) buffer_[i] = begin[i];
+        len_ = n;
     }
 
-    // Unsafe direct data access for performance-critical internal use only
-    uint8_t* raw_data() { return buffer_.data(); }
-    const uint8_t* raw_data() const { return buffer_.data(); }
-
 private:
-    std::vector<uint8_t> buffer_;
+    std::array<uint8_t, nci::NCI_MAX_PACKET_SIZE> buffer_{};
+    uint16_t len_ = 0;
 };
 
 // --- Event Queue Types ---
@@ -308,8 +312,10 @@ public:
     [[nodiscard]] esp_err_t initialize();
 
     // NCI Commands (High Level)
-    [[nodiscard]] esp_err_t core_reset(bool reset_config);
-    [[nodiscard]] esp_err_t core_init();
+    // These helpers reuse caller-provided NciMessage buffers to avoid
+    // stacking multiple 260-byte objects inside nested init calls.
+    [[nodiscard]] esp_err_t core_reset(bool reset_config, NciMessage& cmd, NciMessage& rsp, NciMessage& ntf);
+    [[nodiscard]] esp_err_t core_init(NciMessage& cmd, NciMessage& rsp);
     [[nodiscard]] esp_err_t core_set_config(const std::vector<uint8_t>& config_params);
     [[nodiscard]] esp_err_t rf_discover_map(const std::vector<uint8_t>& mappings);
     [[nodiscard]] esp_err_t rf_set_listen_mode_routing(
@@ -353,8 +359,16 @@ private:
     [[nodiscard]] esp_err_t read_nci_packet(NciMessage& msg, uint32_t timeout_ms);
     [[nodiscard]] esp_err_t write_nci_packet(const NciMessage& msg);
 
-    // Hardware Control
-    [[nodiscard]] esp_err_t hardware_reset(); // Toggles VEN pin
+    // Init helper: send command, read response, validate type
+    [[nodiscard]] esp_err_t send_init_command(const NciMessage& cmd,
+                                               NciMessage& rsp,
+                                               uint8_t expected_gid,
+                                               uint8_t expected_oid,
+                                               const char* name);
+
+    // Sync helpers
+    [[nodiscard]] esp_err_t validate_response(const NciMessage& cmd, const NciMessage& rsp);
+    bool try_dispatch_sync(const NciMessage& msg);
 
     // Internal state/config
     IPN7160Transport& transport;
@@ -362,14 +376,16 @@ private:
     std::atomic<bool> initialized_{false};
     std::atomic<bool> stop_flag_{false};
 
-    // --- Members for Synchronous Exchange ---
-    SemaphoreHandle_t apdu_sync_sem_ = nullptr;
-    SemaphoreHandle_t cmd_sync_sem_ = nullptr;
-    SemaphoreHandle_t sync_mutex_ = nullptr; // Mutex for flag and buffer
-    std::vector<uint8_t> sync_apdu_response_;
+    // --- Unified Synchronous Exchange ---
+    enum class SyncWaitType : uint8_t { NONE, CMD, APDU };
+
+    SemaphoreHandle_t sync_sem_ = nullptr;
+    SemaphoreHandle_t sync_mutex_ = nullptr;
+    std::atomic<bool> sync_pending_{false};
+    SyncWaitType sync_type_{SyncWaitType::NONE};
     NciMessage sync_cmd_response_;
-    std::atomic<bool> sync_apdu_in_progress_{false};
-    std::atomic<bool> sync_cmd_in_progress_{false};
+    std::array<uint8_t, nci::NCI_MAX_PAYLOAD_SIZE> sync_apdu_response_{};
+    size_t sync_apdu_response_len_ = 0;
 
     std::atomic<bool> selected_tag_still_in_field{false};
 
@@ -377,6 +393,14 @@ private:
     QueueHandle_t event_queue_ = nullptr;
     static constexpr size_t EVENT_QUEUE_SIZE = 10;
     void post_event(NciEventType type, const NciMessage& msg);
+
+    // Task runner dispatch helpers
+    void dispatch_data_packet(const NciMessage& msg);
+    void dispatch_control_response(const NciMessage& msg);
+    void dispatch_control_notification(const NciMessage& msg);
+    void handle_rf_notification_oid(uint8_t oid, const NciMessage& msg);
+    void handle_core_oid(uint8_t oid, const NciMessage& msg, bool is_response);
+    void signal_sync_failure();
 
     static constexpr const char* TAG = "PN7160_NCI"; // Logging tag
 };

@@ -10,9 +10,6 @@
 
 #include <cstring>
 
-// Max application payload (255) + NCI header (3) + SPI TDD (1)
-static constexpr size_t MAX_SPI_TRANSFER = 260;
-
 // ---------------------------------------------------------------------------
 // Constructor / Destructor
 // ---------------------------------------------------------------------------
@@ -26,6 +23,10 @@ PN7160_SPI::PN7160_SPI(spi_host_device_t host,
     irq_sem_ = xSemaphoreCreateBinary();
     if (!irq_sem_) {
         ESP_LOGE(TAG, "Failed to create IRQ semaphore");
+    }
+    spi_mutex_ = xSemaphoreCreateMutex();
+    if (!spi_mutex_) {
+        ESP_LOGE(TAG, "Failed to create SPI mutex");
     }
 }
 
@@ -50,11 +51,13 @@ esp_err_t PN7160_SPI::init() {
         .quadhd_io_num = -1,
     };
 
-    esp_err_t ret = spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_CH_AUTO);
+    esp_err_t ret = spi_bus_initialize(host_, &bus, SPI_DMA_CH_AUTO);
     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG, "Failed to initialize SPI bus: %s", esp_err_to_name(ret));
-        vTaskDelete(NULL);
         return ret;
+    }
+    if (ret == ESP_OK) {
+        bus_initialized_ = true;
     }
     // --- VEN (output, start low = chip in reset) ---
     if (pins_.ven != GPIO_NUM_NC) {
@@ -116,6 +119,12 @@ void PN7160_SPI::deinit() {
         ESP_LOGI(TAG, "SPI device removed");
     }
 
+    if (bus_initialized_) {
+        spi_bus_free(host_);
+        bus_initialized_ = false;
+        ESP_LOGI(TAG, "SPI bus freed");
+    }
+
     // Drive VEN low to keep chip in reset
     if (pins_.ven != GPIO_NUM_NC) {
         gpio_set_level(pins_.ven, 0);
@@ -124,6 +133,10 @@ void PN7160_SPI::deinit() {
     if (irq_sem_) {
         vSemaphoreDelete(irq_sem_);
         irq_sem_ = nullptr;
+    }
+    if (spi_mutex_) {
+        vSemaphoreDelete(spi_mutex_);
+        spi_mutex_ = nullptr;
     }
 
     initialized_ = false;
@@ -137,28 +150,34 @@ esp_err_t PN7160_SPI::read(uint8_t* buffer, size_t length) {
     if (!buffer || length == 0) return ESP_ERR_INVALID_ARG;
     if (length + 1 > MAX_SPI_TRANSFER) return ESP_ERR_INVALID_SIZE;
 
+    if (!spi_mutex_) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(spi_mutex_, portMAX_DELAY) != pdTRUE) return ESP_FAIL;
+
     // Full-duplex: transmit TDD_READ + dummy bytes while clocking in data.
     const size_t total = length + 1; // TDD byte + payload
 
-    alignas(4) uint8_t tx[MAX_SPI_TRANSFER];
-    alignas(4) uint8_t rx[MAX_SPI_TRANSFER];
-
-    tx[0] = PN7160_SPI_TDD_READ;
-    memset(tx + 1, 0xFF, length);
+    tx_buf_[0] = PN7160_SPI_TDD_READ;
+    memset(tx_buf_ + 1, 0xFF, length);
 
     spi_transaction_t trans = {};
     trans.length    = total * 8;
     trans.rxlength  = total * 8;
-    trans.tx_buffer = tx;
-    trans.rx_buffer = rx;
+    trans.tx_buffer = tx_buf_;
+    trans.rx_buffer = rx_buf_;
 
-    ESP_RETURN_ON_ERROR(spi_transfer(&trans), TAG, "SPI read transfer failed");
+    esp_err_t ret = spi_transfer(&trans);
+    if (ret != ESP_OK) {
+        xSemaphoreGive(spi_mutex_);
+        ESP_LOGE(TAG, "SPI read transfer failed");
+        return ret;
+    }
 
     ESP_LOGD(TAG, "SPI read raw (%zu bytes):", total);
-    ESP_LOG_BUFFER_HEXDUMP(TAG, rx, total, ESP_LOG_DEBUG);
+    ESP_LOG_BUFFER_HEXDUMP(TAG, rx_buf_, total, ESP_LOG_DEBUG);
 
     // Byte 0 received opposite TDD is discarded; bytes 1..N are data.
-    memcpy(buffer, rx + 1, length);
+    memcpy(buffer, rx_buf_ + 1, length);
+    xSemaphoreGive(spi_mutex_);
     return ESP_OK;
 }
 
@@ -166,19 +185,23 @@ esp_err_t PN7160_SPI::write(const uint8_t* buffer, size_t length) {
     if (!buffer || length == 0) return ESP_ERR_INVALID_ARG;
     if (length + 1 > MAX_SPI_TRANSFER) return ESP_ERR_INVALID_SIZE;
 
-    alignas(4) uint8_t tx[MAX_SPI_TRANSFER];
-    tx[0] = PN7160_SPI_TDD_WRITE;
-    memcpy(tx + 1, buffer, length);
+    if (!spi_mutex_) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(spi_mutex_, portMAX_DELAY) != pdTRUE) return ESP_FAIL;
+
+    tx_buf_[0] = PN7160_SPI_TDD_WRITE;
+    memcpy(tx_buf_ + 1, buffer, length);
 
     spi_transaction_t trans = {
         .flags     = 0,
         .length    = (length + 1) * 8,
         .rxlength  = 0,
-        .tx_buffer = tx,
+        .tx_buffer = tx_buf_,
         .rx_buffer = nullptr,
     };
 
-    return spi_transfer(&trans);
+    esp_err_t ret = spi_transfer(&trans);
+    xSemaphoreGive(spi_mutex_);
+    return ret;
 }
 
 // ---------------------------------------------------------------------------
@@ -246,17 +269,6 @@ esp_err_t PN7160_SPI::configure_gpio_output(gpio_num_t pin,
     ESP_RETURN_ON_ERROR(gpio_config(&cfg), TAG, "gpio_config output failed");
     gpio_set_level(pin, initial_level ? 1 : 0);
     return ESP_OK;
-}
-
-esp_err_t PN7160_SPI::configure_gpio_input(gpio_num_t pin) {
-    gpio_config_t cfg = {
-        .pin_bit_mask = 1ULL << pin,
-        .mode         = GPIO_MODE_INPUT,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
-    };
-    return gpio_config(&cfg);
 }
 
 void PN7160_SPI::chip_select(bool assert) {
