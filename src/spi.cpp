@@ -2,6 +2,7 @@
 
 #include "driver/gpio.h"
 #include "esp_check.h"
+#include "esp_err.h"
 #include "esp_log.h"
 #include "esp_log_buffer.h"
 #include "freertos/idf_additions.h"
@@ -17,7 +18,7 @@ static constexpr size_t MAX_SPI_TRANSFER = 260;
 // ---------------------------------------------------------------------------
 
 PN7160_SPI::PN7160_SPI(spi_host_device_t host,
-                                           const PN7160_SPI_PinConfig& pins,
+                                           const PN7160_SPI_Config& pins,
                                            int clock_mhz)
     : host_(host),
       pins_(pins),
@@ -41,6 +42,20 @@ esp_err_t PN7160_SPI::init() {
 
     if (!irq_sem_) return ESP_ERR_NO_MEM;
 
+    spi_bus_config_t bus {
+        .mosi_io_num = pins_.mosi,
+        .miso_io_num = pins_.miso,
+        .sclk_io_num = pins_.sclk,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+    };
+
+    esp_err_t ret = spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_CH_AUTO);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "Failed to initialize SPI bus: %s", esp_err_to_name(ret));
+        vTaskDelete(NULL);
+        return ret;
+    }
     // --- VEN (output, start low = chip in reset) ---
     if (pins_.ven != GPIO_NUM_NC) {
         ESP_RETURN_ON_ERROR(configure_gpio_output(pins_.ven, /*level=*/false),
