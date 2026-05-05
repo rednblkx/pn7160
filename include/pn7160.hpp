@@ -254,6 +254,21 @@ private:
     std::vector<uint8_t> buffer_;
 };
 
+// --- Event Queue Types ---
+
+enum class NciEventType {
+    RF_INTF_ACTIVATED,
+    RF_DISCOVER,
+    RF_DEACTIVATE,
+    CORE_NOTIFICATION,
+    DATA_PACKET
+};
+
+struct NciEvent {
+    NciEventType type;
+    NciMessage msg;
+};
+
 // --- FreeRTOS RAII Helpers ---
 
 /**
@@ -285,13 +300,6 @@ private:
 // --- Main Driver Class ---
 class PN7160_NCI {
 public:
-    // --- Callbacks ---
-    using RfInterfaceActivatedCallback = std::function<void(const NciMessage&)>;
-    using RfDiscoverCallback = std::function<void(const NciMessage&)>;
-    using RfDeactivateCallback = std::function<void(const NciMessage&)>;
-    using CoreNotificationCallback = std::function<void(const NciMessage&)>;
-    using DataPacketCallback = std::function<void(const NciMessage&)>;
-
     explicit PN7160_NCI(IPN7160Transport& transport);
     ~PN7160_NCI();
 
@@ -326,22 +334,13 @@ public:
     // Returns ESP_OK on successful SPI write, ESP error code otherwise.
     [[nodiscard]] esp_err_t send_data_packet(const NciMessage& data_pkt);
 
-    // Register callbacks
-    void set_on_rf_interface_activated(RfInterfaceActivatedCallback cb) {
-        on_rf_intf_activated_ = std::move(cb);
-    }
-    void set_on_rf_discover(RfDiscoverCallback cb) {
-        on_rf_discover_ = std::move(cb);
-    }
-    void set_on_rf_deactivate(RfDeactivateCallback cb) {
-        on_rf_deactivate_ = std::move(cb);
-    }
-    void set_on_core_notification(CoreNotificationCallback cb) {
-        on_core_notification_ = std::move(cb);
-    }
-    void set_on_data_packet(DataPacketCallback cb) {
-        on_data_packet_ = std::move(cb);
-    }
+    // Get the next event from the driver's internal queue.
+    // Blocks up to timeout_ms.  Copies the event into @p event.
+    [[nodiscard]] esp_err_t get_event(NciEvent& event,
+                                      uint32_t timeout_ms = portMAX_DELAY);
+
+    // Access the underlying event queue directly (advanced use)
+    QueueHandle_t event_queue() const { return event_queue_; }
 
     // Task runner function to process incoming messages (run this in a FreeRTOS task)
     void task_runner();
@@ -363,20 +362,21 @@ private:
     std::atomic<bool> initialized_{false};
     std::atomic<bool> stop_flag_{false};
 
-    // --- Members for Synchronous APDU Exchange ---
+    // --- Members for Synchronous Exchange ---
     SemaphoreHandle_t apdu_sync_sem_ = nullptr;
+    SemaphoreHandle_t cmd_sync_sem_ = nullptr;
     SemaphoreHandle_t sync_mutex_ = nullptr; // Mutex for flag and buffer
     std::vector<uint8_t> sync_apdu_response_;
+    NciMessage sync_cmd_response_;
     std::atomic<bool> sync_apdu_in_progress_{false};
+    std::atomic<bool> sync_cmd_in_progress_{false};
 
     std::atomic<bool> selected_tag_still_in_field{false};
 
-    // Callbacks
-    RfInterfaceActivatedCallback on_rf_intf_activated_;
-    RfDiscoverCallback on_rf_discover_;
-    RfDeactivateCallback on_rf_deactivate_;
-    CoreNotificationCallback on_core_notification_;
-    DataPacketCallback on_data_packet_;
+    // Event queue
+    QueueHandle_t event_queue_ = nullptr;
+    static constexpr size_t EVENT_QUEUE_SIZE = 10;
+    void post_event(NciEventType type, const NciMessage& msg);
 
     static constexpr const char* TAG = "PN7160_NCI"; // Logging tag
 };

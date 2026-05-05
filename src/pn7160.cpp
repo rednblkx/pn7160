@@ -46,11 +46,15 @@ static const uint8_t CORE_CONFIG_TOTAL_DURATION_SOLO[] = {
 PN7160_NCI::PN7160_NCI(IPN7160Transport& transport) :
     transport(transport) {
     apdu_sync_sem_ = xSemaphoreCreateBinary();
+    cmd_sync_sem_ = xSemaphoreCreateBinary();
     sync_mutex_ = xSemaphoreCreateMutex();
-    if (!apdu_sync_sem_ || !sync_mutex_) {
-        ESP_LOGE(TAG, "Failed to create synchronization primitives");
+    event_queue_ = xQueueCreate(EVENT_QUEUE_SIZE, sizeof(NciEvent*));
+    if (!apdu_sync_sem_ || !cmd_sync_sem_ || !sync_mutex_ || !event_queue_) {
+        ESP_LOGE(TAG, "Failed to create synchronization primitives or event queue");
         if (apdu_sync_sem_) vSemaphoreDelete(apdu_sync_sem_);
+        if (cmd_sync_sem_) vSemaphoreDelete(cmd_sync_sem_);
         if (sync_mutex_) vSemaphoreDelete(sync_mutex_);
+        if (event_queue_) vQueueDelete(event_queue_);
     }
 }
 
@@ -58,10 +62,50 @@ PN7160_NCI::~PN7160_NCI() {
     shutdown();
     if (apdu_sync_sem_) {
         vSemaphoreDelete(apdu_sync_sem_);
+        apdu_sync_sem_ = nullptr;
+    }
+    if (cmd_sync_sem_) {
+        vSemaphoreDelete(cmd_sync_sem_);
+        cmd_sync_sem_ = nullptr;
     }
     if (sync_mutex_) {
         vSemaphoreDelete(sync_mutex_);
+        sync_mutex_ = nullptr;
     }
+    if (event_queue_) {
+        NciEvent* evt = nullptr;
+        while (xQueueReceive(event_queue_, &evt, 0) == pdTRUE) {
+            delete evt;
+        }
+        vQueueDelete(event_queue_);
+        event_queue_ = nullptr;
+    }
+}
+
+// --- Event Queue Helpers ---
+
+void PN7160_NCI::post_event(NciEventType type, const NciMessage& msg) {
+    if (!event_queue_) return;
+    auto* evt = new (std::nothrow) NciEvent{type, msg};
+    if (!evt) {
+        ESP_LOGW(TAG, "Failed to allocate NciEvent");
+        return;
+    }
+    if (xQueueSend(event_queue_, &evt, pdMS_TO_TICKS(10)) != pdTRUE) {
+        ESP_LOGW(TAG, "Event queue full, dropping event");
+        delete evt;
+    }
+}
+
+esp_err_t PN7160_NCI::get_event(NciEvent& event, uint32_t timeout_ms) {
+    if (!event_queue_) return ESP_ERR_INVALID_STATE;
+    NciEvent* evt_ptr = nullptr;
+    if (xQueueReceive(event_queue_, &evt_ptr, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
+        event = std::move(*evt_ptr);
+        delete evt_ptr;
+        return ESP_OK;
+    }
+    return ESP_ERR_TIMEOUT;
 }
 
 // --- Initialization ---
@@ -288,41 +332,103 @@ esp_err_t PN7160_NCI::send_command_wait_response(NciMessage& cmd,
         return ESP_ERR_INVALID_STATE;
     }
 
-    // --- GENERIC HANDLING (for all other commands) ---
     ESP_LOGD(TAG, "Sending CMD: GID=0x%02X, OID=0x%02X, Len=%d", cmd.get_gid(),
              cmd.get_oid(), cmd.get_len());
+
+    bool use_semaphore = (task_handle_ != nullptr) &&
+                         (xTaskGetCurrentTaskHandle() != task_handle_);
+
+    if (!use_semaphore) {
+        // --- DIRECT READ PATH: used during init (before task_runner) or from inside task_runner ---
+        esp_err_t write_status = write_nci_packet(cmd);
+        if (write_status != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to write NCI command (err=0x%X)", write_status);
+            return write_status;
+        }
+
+        esp_err_t read_status = read_nci_packet(rsp, timeout_ms);
+        if (read_status != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to read NCI response (err=0x%X)", read_status);
+            return read_status;
+        }
+
+        ESP_LOGD(TAG,
+                 "Received RSP: MT=0x%X, GID=0x%02X, OID=0x%02X, Len=%d, "
+                 "Status=0x%X",
+                 rsp.get_mt(), rsp.get_gid(), rsp.get_oid(), rsp.get_len(),
+                 rsp.get_status());
+
+        if (!rsp.is_control_response(cmd.get_gid(), cmd.get_oid())) {
+            ESP_LOGE(TAG,
+                     "Unexpected NCI packet received. Expected RSP for GID=0x%02X, "
+                     "OID=0x%02X. Got MT=%d, GID=0x%02X, OID=0x%02X",
+                     cmd.get_gid(), cmd.get_oid(), rsp.get_mt(), rsp.get_gid(),
+                     rsp.get_oid());
+            ESP_LOG_BUFFER_HEXDUMP(TAG, rsp.data(), rsp.size(), ESP_LOG_ERROR);
+            return nci::STATUS_FAILED;
+        }
+
+        return rsp.get_status();
+    }
+
+    // --- SEMAPHORE PATH: task_runner is running, we're in a different task ---
+    if (xSemaphoreTake(sync_mutex_, pdMS_TO_TICKS(50)) != pdTRUE) {
+        ESP_LOGE(TAG, "send_command_wait_response: Could not acquire sync mutex.");
+        return ESP_FAIL;
+    }
+    if (sync_cmd_in_progress_.load()) {
+        ESP_LOGE(TAG, "send_command_wait_response: Another sync command is already in progress.");
+        xSemaphoreGive(sync_mutex_);
+        return ESP_ERR_INVALID_STATE;
+    }
+    sync_cmd_in_progress_.store(true);
+    sync_cmd_response_.clear();
+    xSemaphoreTake(cmd_sync_sem_, 0); // Clear any stale signal
+    xSemaphoreGive(sync_mutex_);
+
     esp_err_t write_status = write_nci_packet(cmd);
     if (write_status != ESP_OK) {
         ESP_LOGE(TAG, "Failed to write NCI command (err=0x%X)", write_status);
-        return write_status; // Return ESP-IDF error
+        sync_cmd_in_progress_.store(false);
+        return write_status;
     }
 
-    // Wait for and read the response
-    esp_err_t read_status = read_nci_packet(rsp, timeout_ms);
-    if (read_status != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to read NCI response (err=0x%X)", read_status);
-        return read_status; // Return ESP-IDF error
+    esp_err_t result = ESP_FAIL;
+    if (xSemaphoreTake(cmd_sync_sem_, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
+        if (xSemaphoreTake(sync_mutex_, pdMS_TO_TICKS(50)) == pdTRUE) {
+            if (!sync_cmd_response_.empty() &&
+                sync_cmd_response_.is_control_response(cmd.get_gid(), cmd.get_oid())) {
+                rsp = sync_cmd_response_;
+                result = rsp.get_status();
+                ESP_LOGD(TAG,
+                         "Received RSP: MT=0x%X, GID=0x%02X, OID=0x%02X, Len=%d, "
+                         "Status=0x%X",
+                         rsp.get_mt(), rsp.get_gid(), rsp.get_oid(), rsp.get_len(),
+                         rsp.get_status());
+            } else {
+                ESP_LOGE(TAG,
+                         "Unexpected NCI packet received. Expected RSP for GID=0x%02X, "
+                         "OID=0x%02X. Got MT=%d, GID=0x%02X, OID=0x%02X",
+                         cmd.get_gid(), cmd.get_oid(),
+                         sync_cmd_response_.get_mt(),
+                         sync_cmd_response_.get_gid(),
+                         sync_cmd_response_.get_oid());
+                result = nci::STATUS_FAILED;
+            }
+            sync_cmd_in_progress_.store(false);
+            xSemaphoreGive(sync_mutex_);
+        } else {
+            ESP_LOGE(TAG, "send_command_wait_response: Could not acquire sync mutex after semaphore.");
+            sync_cmd_in_progress_.store(false);
+            result = ESP_FAIL;
+        }
+    } else {
+        ESP_LOGE(TAG, "send_command_wait_response: Timeout waiting for RSP.");
+        sync_cmd_in_progress_.store(false);
+        result = ESP_ERR_TIMEOUT;
     }
 
-    ESP_LOGD(TAG,
-             "Received RSP: MT=0x%X, GID=0x%02X, OID=0x%02X, Len=%d, "
-             "Status=0x%X",
-             rsp.get_mt(), rsp.get_gid(), rsp.get_oid(), rsp.get_len(),
-             rsp.get_status());
-
-    // Basic validation: Check if it's a response, matches GID/OID
-    if (!rsp.is_control_response(cmd.get_gid(), cmd.get_oid())) {
-        ESP_LOGE(TAG,
-                 "Unexpected NCI packet received. Expected RSP for GID=0x%02X, "
-                 "OID=0x%02X. Got MT=%d, GID=0x%02X, OID=0x%02X",
-                 cmd.get_gid(), cmd.get_oid(), rsp.get_mt(), rsp.get_gid(),
-                 rsp.get_oid());
-        ESP_LOG_BUFFER_HEXDUMP(TAG, rsp.data(), rsp.size(), ESP_LOG_ERROR);
-        return nci::STATUS_FAILED; // Return NCI failure status
-    }
-
-    // Return the NCI status code from the response payload
-    return rsp.get_status(); // NCI status code, 0x00 is nci::STATUS_OK
+    return result;
 }
 
 esp_err_t PN7160_NCI::send_data_packet(const NciMessage& data_pkt) {
@@ -635,51 +741,19 @@ esp_err_t PN7160_NCI::rf_select_target(uint8_t discovery_id, uint8_t protocol,
 }
 
 // Returns NCI Status Code (nci::STATUS_OK if RSP is OK, error otherwise)
-// Note: This function waits for the NTF as well for completion.
+// The RF_DEACTIVATE_NTF is delivered through the event queue.
 esp_err_t PN7160_NCI::rf_deactivate(uint8_t type) {
     NciMessage cmd(nci::PKT_MT_CTRL_COMMAND, nci::RF_GID, nci::RF_DEACTIVATE_OID, {type});
     NciMessage rsp;
-    NciMessage ntf;
 
-    esp_err_t nci_status = write_nci_packet(cmd);
-    if (nci_status != nci::STATUS_OK) {
-        ESP_LOGE(TAG, "RF_DEACTIVATE_CMD failed (NCI Status=0x%X)", nci_status);
-        return nci_status; // Return the error status from RSP
+    esp_err_t status = send_command_wait_response(cmd, rsp, 1000);
+    if (status != nci::STATUS_OK) {
+        ESP_LOGE(TAG, "RF_DEACTIVATE_CMD failed (NCI Status=0x%X)", status);
+        return status;
     }
 
-    esp_err_t read_status =
-    read_nci_packet(ntf, nci::PN7160_DEFAULT_TIMEOUT_MS * 2); // Longer timeout?
-    if (read_status != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to read RF_DEACTIVATE_CMD (err=0x%X)",
-                read_status);
-        return nci::STATUS_FAILED; // Indicate failure to get RSP
-    }
-
-    if (!ntf.is_control_response(nci::RF_GID, nci::RF_DEACTIVATE_OID)) {
-        ESP_LOGE(TAG, "Unexpected packet received after RF_DEACTIVATE_RSP");
-        ESP_LOG_BUFFER_HEXDUMP(TAG, ntf.data(), ntf.size(), ESP_LOG_WARN);
-        return nci::STATUS_FAILED; // Indicate unexpected packet
-    }
-
-    // If RSP is OK, expect RF_DEACTIVATE_NTF
-    ESP_LOGD(TAG, "Expecting RF_DEACTIVATE_NTF...");
-    read_status =
-        read_nci_packet(ntf, nci::PN7160_DEFAULT_TIMEOUT_MS * 2); // Longer timeout?
-    if (read_status != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to read RF_DEACTIVATE_NTF (err=0x%X)",
-                 read_status);
-        return nci::STATUS_FAILED; // Indicate failure to get NTF
-    }
-
-    // Log info from NTF (NCI 2.0 Table 69)
-    if (ntf.get_len() >= 2) {
-        ESP_LOGD(TAG, "RF_DEACTIVATE_NTF received. Type: 0x%02X, Reason: 0x%02X",
-                 ntf[3], ntf[4]);
-    } else {
-         ESP_LOGW(TAG, "RF_DEACTIVATE_NTF payload too short (%d bytes)", ntf.get_len());
-    }
-
-    return nci::STATUS_OK; // Return OK as both RSP and NTF were handled
+    ESP_LOGD(TAG, "RF_DEACTIVATE_RSP OK");
+    return nci::STATUS_OK;
 }
 
 esp_err_t PN7160_NCI::rf_iso_dep_presence_check() {
@@ -725,7 +799,7 @@ void PN7160_NCI::task_runner() {
             if (ret == ESP_OK) {
                 bool processed_synchronously = false;
 
-                // --- Check if this is data for a synchronous wait ---
+                // --- Check if this is data for a synchronous APDU wait ---
                 if (incoming_msg.get_mt() == nci::PKT_MT_DATA) {
                     ScopedMutex lock(sync_mutex_, pdMS_TO_TICKS(10));
                     if (lock.acquired()) {
@@ -733,6 +807,21 @@ void PN7160_NCI::task_runner() {
                             ESP_LOGD(TAG, "Data packet received during sync APDU wait");
                             sync_apdu_response_ = incoming_msg.get_payload_copy();
                             xSemaphoreGive(apdu_sync_sem_);
+                            processed_synchronously = true;
+                        }
+                    } else {
+                        ESP_LOGE(TAG, "Failed to take sync mutex in task_runner!");
+                    }
+                }
+
+                // --- Check if this is a control response for a synchronous command wait ---
+                if (!processed_synchronously && incoming_msg.get_mt() == nci::PKT_MT_CTRL_RESPONSE) {
+                    ScopedMutex lock(sync_mutex_, pdMS_TO_TICKS(10));
+                    if (lock.acquired()) {
+                        if (sync_cmd_in_progress_.load()) {
+                            ESP_LOGD(TAG, "Control response received during sync command wait");
+                            sync_cmd_response_ = incoming_msg;
+                            xSemaphoreGive(cmd_sync_sem_);
                             processed_synchronously = true;
                         }
                     } else {
@@ -752,27 +841,26 @@ void PN7160_NCI::task_runner() {
                                                 incoming_msg[3], incoming_msg[4],
                                                 incoming_msg[5], incoming_msg[6]);
                                         selected_tag_still_in_field.store(true);
-                                        if (on_rf_intf_activated_) on_rf_intf_activated_(incoming_msg);
+                                        post_event(NciEventType::RF_INTF_ACTIVATED, incoming_msg);
                                         break;
                                     case nci::RF_DISCOVER_OID:
                                         ESP_LOGD(TAG, "RF_DISCOVER_NTF received");
-                                        if (on_rf_discover_) on_rf_discover_(incoming_msg);
+                                        post_event(NciEventType::RF_DISCOVER, incoming_msg);
                                         break;
                                     case nci::RF_DEACTIVATE_OID: // RF_DEACTIVATE_NTF
                                     if (incoming_msg.get_len() >= 2) { // Need Type and Reason
                                         uint8_t deact_type = incoming_msg[3];
                                         uint8_t deact_reason = incoming_msg[4];
                                         ESP_LOGD(TAG, "RF_DEACTIVATE_NTF received. Type: 0x%02X, Reason: 0x%02X", deact_type, deact_reason);
-                    
+
                                         if (deact_reason == 0x02) { // 0x02 = RF_Link_Loss
                                             ESP_LOGW(TAG, "Tag removed (RF Link Loss detected by NFCC)!");
                                         } else {
                                             ESP_LOGD(TAG, "Deactivation reason was not Link Loss.");
                                         }
-                    
-                                        if (on_rf_deactivate_)
-                                            on_rf_deactivate_(incoming_msg);
-                    
+
+                                        post_event(NciEventType::RF_DEACTIVATE, incoming_msg);
+
                                     } else {
                                         ESP_LOGW(TAG, "RF_DEACTIVATE_NTF payload too short (%d bytes)", incoming_msg.get_len());
                                     }
@@ -799,22 +887,22 @@ void PN7160_NCI::task_runner() {
                                 switch (incoming_msg.get_oid()) {
                                     case nci::CORE_GENERIC_ERROR_OID:
                                         ESP_LOGW(TAG, "CORE_GENERIC_ERROR_NTF Status: 0x%X", incoming_msg.get_status());
-                                        if (on_core_notification_) on_core_notification_(incoming_msg);
+                                        post_event(NciEventType::CORE_NOTIFICATION, incoming_msg);
                                         break;
                                     case nci::CORE_INTERFACE_ERROR_OID:
                                         ESP_LOGW(TAG, "CORE_INTERFACE_ERROR_NTF Status: 0x%X ConnID: %d",
                                                 incoming_msg[3], incoming_msg[4]);
                                         selected_tag_still_in_field.store(true);
                                         selected_tag_still_in_field.notify_all();
-                                        if (on_core_notification_) on_core_notification_(incoming_msg);
+                                        post_event(NciEventType::CORE_NOTIFICATION, incoming_msg);
                                         break;
                                     case nci::CORE_CONN_CREDITS_OID:
                                         ESP_LOGD(TAG, "CORE_CONN_CREDITS_NTF received");
-                                        if (on_core_notification_) on_core_notification_(incoming_msg);
+                                        post_event(NciEventType::CORE_NOTIFICATION, incoming_msg);
                                         break;
                                     default:
                                         ESP_LOGW(TAG, "Unhandled Core Notification OID: 0x%02X", incoming_msg.get_oid());
-                                        if (on_core_notification_) on_core_notification_(incoming_msg);
+                                        post_event(NciEventType::CORE_NOTIFICATION, incoming_msg);
                                         break;
                                 }
                             } else {
@@ -824,7 +912,7 @@ void PN7160_NCI::task_runner() {
 
                         case nci::PKT_MT_DATA:
                             ESP_LOGD(TAG, "Received DATA packet, Len=%d", incoming_msg.get_len());
-                            if (on_data_packet_) on_data_packet_(incoming_msg);
+                            post_event(NciEventType::DATA_PACKET, incoming_msg);
                             break; // End case DATA
 
                         case nci::PKT_MT_CTRL_RESPONSE:
@@ -833,9 +921,7 @@ void PN7160_NCI::task_runner() {
                                     case nci::RF_INTF_ACTIVATED_OID:{
                                         selected_tag_still_in_field.store(true);
                                         selected_tag_still_in_field.notify_all();
-                                        if (on_rf_intf_activated_) {
-                                            on_rf_intf_activated_(incoming_msg);
-                                        }
+                                        post_event(NciEventType::RF_INTF_ACTIVATED, incoming_msg);
                                     }
                                     break;
                                     case nci::RF_ISO_DEP_NAK_PRESENCE_OID:{
@@ -886,10 +972,17 @@ void PN7160_NCI::task_runner() {
                 ESP_LOGE(TAG, "Error reading NCI packet: 0x%X", ret);
                 {
                     ScopedMutex lock(sync_mutex_, pdMS_TO_TICKS(10));
-                    if (lock.acquired() && sync_apdu_in_progress_.load()) {
-                        ESP_LOGE(TAG, "Signaling APDU sync failure due to read error");
-                        sync_apdu_response_.clear(); // Ensure no stale data
-                        xSemaphoreGive(apdu_sync_sem_); // Signal failure
+                    if (lock.acquired()) {
+                        if (sync_apdu_in_progress_.load()) {
+                            ESP_LOGE(TAG, "Signaling APDU sync failure due to read error");
+                            sync_apdu_response_.clear();
+                            xSemaphoreGive(apdu_sync_sem_);
+                        }
+                        if (sync_cmd_in_progress_.load()) {
+                            ESP_LOGE(TAG, "Signaling CMD sync failure due to read error");
+                            sync_cmd_response_.clear();
+                            xSemaphoreGive(cmd_sync_sem_);
+                        }
                     }
                 }
                 vTaskDelay(pdMS_TO_TICKS(1000));
@@ -898,10 +991,17 @@ void PN7160_NCI::task_runner() {
             ESP_LOGE(TAG, "Error waiting for IRQ semaphore (returned %#X)", ret);
             {
                 ScopedMutex lock(sync_mutex_, pdMS_TO_TICKS(10));
-                if (lock.acquired() && sync_apdu_in_progress_.load()) {
-                    ESP_LOGE(TAG, "Signaling APDU sync failure due to IRQ wait error");
-                    sync_apdu_response_.clear(); // Ensure no stale data
-                    xSemaphoreGive(apdu_sync_sem_); // Signal failure
+                if (lock.acquired()) {
+                    if (sync_apdu_in_progress_.load()) {
+                        ESP_LOGE(TAG, "Signaling APDU sync failure due to IRQ wait error");
+                        sync_apdu_response_.clear();
+                        xSemaphoreGive(apdu_sync_sem_);
+                    }
+                    if (sync_cmd_in_progress_.load()) {
+                        ESP_LOGE(TAG, "Signaling CMD sync failure due to IRQ wait error");
+                        sync_cmd_response_.clear();
+                        xSemaphoreGive(cmd_sync_sem_);
+                    }
                 }
             }
             vTaskDelay(pdMS_TO_TICKS(1000));
