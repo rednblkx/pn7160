@@ -354,6 +354,10 @@ public:
     // Signal the task runner to stop gracefully
     void shutdown();
 
+    // Query initialization state
+    bool is_initialized() const { return initialized_.load(); }
+    bool tag_in_field() const { return selected_tag_still_in_field.load(); }
+
 private:
     // NCI Packet Read/Write
     [[nodiscard]] esp_err_t read_nci_packet(NciMessage& msg, uint32_t timeout_ms);

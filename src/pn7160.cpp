@@ -707,6 +707,7 @@ void PN7160_NCI::handle_rf_notification_oid(uint8_t oid, const NciMessage& msg) 
                 if (deact_reason == 0x02) {
                     ESP_LOGW(TAG, "Tag removed (RF Link Loss detected by NFCC)!");
                 }
+                selected_tag_still_in_field.store(false);
                 post_event(NciEventType::RF_DEACTIVATE, msg);
             } else {
                 ESP_LOGW(TAG, "RF_DEACTIVATE_NTF payload too short (%d bytes)", msg.get_len());
@@ -714,15 +715,11 @@ void PN7160_NCI::handle_rf_notification_oid(uint8_t oid, const NciMessage& msg) 
             break;
         }
         case nci::RF_ISO_DEP_NAK_PRESENCE_OID: {
-            esp_log_buffer_hexdump_internal(TAG, msg.data(), msg.size(), ESP_LOG_DEBUG);
-            uint8_t presence = msg[3];
-            if (presence != 0x00) {
-                ESP_LOGW(TAG, "Tag no longer in field");
-                selected_tag_still_in_field.store(false);
-                (void)rf_deactivate(nci::DEACTIVATION_TYPE_DISCOVERY);
-            } else {
-                ESP_LOGD(TAG, "Tag still in field");
-                (void)rf_iso_dep_presence_check();
+            if (msg.get_len() >= 1) {
+                uint8_t presence = msg[3];
+                selected_tag_still_in_field.store(presence == 0x00);
+                ESP_LOGD(TAG, "RF_ISO_DEP_NAK_PRESENCE_NTF: presence=0x%02X, in_field=%d",
+                         presence, selected_tag_still_in_field.load());
             }
             break;
         }
@@ -742,7 +739,6 @@ void PN7160_NCI::handle_core_oid(uint8_t oid, const NciMessage& msg, bool is_res
         case nci::CORE_INTERFACE_ERROR_OID:
             ESP_LOGW(TAG, "CORE_INTERFACE_ERROR_%s Status: 0x%X ConnID: %d",
                      is_response ? "RSP" : "NTF", msg[3], msg[4]);
-            selected_tag_still_in_field.store(true);
             if (!is_response) post_event(NciEventType::CORE_NOTIFICATION, msg);
             break;
         case nci::CORE_CONN_CREDITS_OID:
@@ -781,9 +777,7 @@ void PN7160_NCI::dispatch_control_response(const NciMessage& msg) {
                 if (msg.get_len() >= 1) {
                     uint8_t presence_status = msg[3];
                     ESP_LOGD(TAG, "RF_ISO_DEP_NAK_PRESENCE_RSP received. Status: 0x%02X", presence_status);
-                    if (presence_status != nci::STATUS_OK) {
-                        (void)rf_deactivate(nci::DEACTIVATION_TYPE_DISCOVERY);
-                    }
+                    selected_tag_still_in_field.store(presence_status == nci::STATUS_OK);
                 } else {
                     ESP_LOGW(TAG, "RF_ISO_DEP_NAK_PRESENCE_RSP payload too short.");
                 }
