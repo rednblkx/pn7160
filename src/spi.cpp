@@ -172,8 +172,8 @@ esp_err_t PN7160_SPI::read(uint8_t* buffer, size_t length) {
         return ret;
     }
 
-    ESP_LOGD(TAG, "SPI read raw (%zu bytes):", total);
-    ESP_LOG_BUFFER_HEXDUMP(TAG, rx_buf_, total, ESP_LOG_DEBUG);
+    ESP_LOGV(TAG, "SPI read raw (%zu bytes):", total);
+    ESP_LOG_BUFFER_HEXDUMP(TAG, rx_buf_, total, ESP_LOG_VERBOSE);
 
     // Byte 0 received opposite TDD is discarded; bytes 1..N are data.
     memcpy(buffer, rx_buf_ + 1, length);
@@ -248,7 +248,7 @@ bool PN7160_SPI::read_irq_level() const {
 void PN7160_SPI::set_ven(bool enable) {
     if (pins_.ven != GPIO_NUM_NC) {
         gpio_set_level(pins_.ven, enable ? 1 : 0);
-        ESP_LOGD(TAG, "VEN -> %d", enable ? 1 : 0);
+        ESP_LOGV(TAG, "VEN -> %d", enable ? 1 : 0);
     }
 }
 
