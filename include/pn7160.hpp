@@ -538,13 +538,6 @@ private:
     [[nodiscard]] esp_err_t read_nci_packet(NciMessage& msg, uint32_t timeout_ms);
     [[nodiscard]] esp_err_t write_nci_packet(const NciMessage& msg);
 
-    // --- Init helpers (used before task_runner starts, direct I/O is safe) ---
-    [[nodiscard]] esp_err_t send_init_command(const NciMessage& cmd,
-                                              NciMessage&       rsp,
-                                              uint8_t           expected_gid,
-                                              uint8_t           expected_oid,
-                                              const char*       name);
-
     // --- Sync exchange helpers (called from task_runner) ---
     //
     // try_complete_exchange() inspects an incoming message and, if it matches

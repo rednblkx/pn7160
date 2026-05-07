@@ -12,33 +12,6 @@
 #include <cstring>
 #include <vector>
 
-// UM11495 Section 13.1 - PMU_CFG (Tag 0xA00E)
-static const uint8_t PMU_CFG[] = {
-    0x01,        // Number of parameters
-    0xA0, 0x0E,  // ext. tag
-    11,          // length
-    0x11,        // IRQ Enable: PVDD + temp sensor IRQs
-    0x01,        // RFU
-    0x01,        // Power and Clock Configuration, device on (CFG1)
-    0x01,        // Power and Clock Configuration, device off (CFG1)
-    0x00,        // RFU
-    0x00,        // DC-DC 0
-    0x00,        // DC-DC 1
-    0xFF,        // TXLDO (5.0V / 5.0V)
-    0x00,        // RFU
-    0xD0,        // TXLDO check
-    0x0C,        // RFU
-};
-
-// NCI Core Spec v2.0 Section 6.1 - TOTAL_DURATION (Tag 0x00)
-static const uint8_t CORE_CONFIG_TOTAL_DURATION_SOLO[] = {
-    0x01,  // Number of parameter fields
-    0x00,  // config param identifier (TOTAL_DURATION)
-    0x02,  // length of value
-    0x64,  // TOTAL_DURATION (low): 0x03E8 = 1000ms... wait, 0x0001 = 1ms.
-    0x00   // TOTAL_DURATION (high)
-};
-
 // =============================================================================
 // Constructor / Destructor
 // =============================================================================
@@ -70,38 +43,6 @@ PN7160_NCI::~PN7160_NCI() {
 // =============================================================================
 // Initialization
 // =============================================================================
-
-esp_err_t PN7160_NCI::send_init_command(const NciMessage& cmd,
-                                        NciMessage&       rsp,
-                                        uint8_t           expected_gid,
-                                        uint8_t           expected_oid,
-                                        const char*       name) {
-    // During init the task_runner is not yet running, so direct I/O is safe.
-    esp_err_t err = write_nci_packet(cmd);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Error sending %s (err=0x%X)", name, err);
-        return err;
-    }
-
-    err = read_nci_packet(rsp, nci::PN7160_INIT_TIMEOUT_MS);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to read %s response (err=0x%X)", name, err);
-        return err;
-    }
-
-    if (!rsp.is_control_response(expected_gid, expected_oid)) {
-        ESP_LOGE(TAG, "Unexpected packet after %s (expected RSP GID=0x%02X OID=0x%02X)",
-                 name, expected_gid, expected_oid);
-        ESP_LOG_BUFFER_HEXDUMP(TAG, rsp.data(), rsp.size(), ESP_LOG_ERROR);
-        return ESP_FAIL;
-    }
-
-    uint8_t nci_status = rsp.get_status();
-    if (nci_status != nci::STATUS_OK)
-        ESP_LOGW(TAG, "%s returned NCI status 0x%02X", name, nci_status);
-
-    return static_cast<esp_err_t>(nci_status);
-}
 
 esp_err_t PN7160_NCI::initialize() {
     ESP_LOGI(TAG, "Initializing PN7160...");
@@ -137,9 +78,7 @@ esp_err_t PN7160_NCI::initialize() {
         NciMessage cmd, rsp;
         cmd.build(nci::PKT_MT_CTRL_COMMAND, nci::PROPRIETARY_GID,
                   nci::CORE_SET_CONFIG_OID);
-        ret = send_init_command(cmd, rsp,
-                                nci::PROPRIETARY_GID, nci::CORE_SET_CONFIG_OID,
-                                "PROPRIETARY_ACT_CMD");
+        ret = send_command_wait_response(cmd, rsp, nci::PN7160_INIT_TIMEOUT_MS);
         if (ret == ESP_FAIL) return ESP_FAIL;
         if (ret != nci::STATUS_OK) {
             ESP_LOGW(TAG, "Proprietary extensions not activated (NCI Status=0x%02X). "
@@ -147,41 +86,6 @@ esp_err_t PN7160_NCI::initialize() {
         } else {
             ESP_LOGI(TAG, "Proprietary extensions activated.");
             ESP_LOG_BUFFER_HEXDUMP(TAG, rsp.get_payload_ptr(), rsp.get_len(), ESP_LOG_DEBUG);
-        }
-    }
-    vTaskDelay(pdMS_TO_TICKS(5));
-
-    ESP_LOGI(TAG, "Sending initial configuration...");
-
-    // PMU Config
-    {
-        NciMessage cmd, rsp;
-        cmd.build(nci::PKT_MT_CTRL_COMMAND, nci::CORE_GID, nci::CORE_SET_CONFIG_OID,
-                  std::vector<uint8_t>(std::begin(PMU_CFG), std::end(PMU_CFG)));
-        ret = send_init_command(cmd, rsp, nci::CORE_GID, nci::CORE_SET_CONFIG_OID,
-                                "PMU_CFG");
-        if (ret == ESP_FAIL) return ESP_FAIL;
-        if (ret != nci::STATUS_OK) {
-            ESP_LOGE(TAG, "Failed to set PMU config (NCI Status=0x%02X)", ret);
-            return ESP_FAIL;
-        }
-        ESP_LOGI(TAG, "PMU Config set successfully");
-    }
-    vTaskDelay(pdMS_TO_TICKS(5));
-
-    // TOTAL_DURATION Config
-    {
-        NciMessage cmd, rsp;
-        cmd.build(nci::PKT_MT_CTRL_COMMAND, nci::CORE_GID, nci::CORE_SET_CONFIG_OID,
-                  std::vector<uint8_t>(std::begin(CORE_CONFIG_TOTAL_DURATION_SOLO),
-                                       std::end(CORE_CONFIG_TOTAL_DURATION_SOLO)));
-        ret = send_init_command(cmd, rsp, nci::CORE_GID, nci::CORE_SET_CONFIG_OID,
-                                "TOTAL_DURATION");
-        if (ret == ESP_FAIL) return ESP_FAIL;
-        if (ret != nci::STATUS_OK) {
-            ESP_LOGE(TAG, "Failed to set TOTAL_DURATION config (NCI Status=0x%02X)", ret);
-        } else {
-            ESP_LOGI(TAG, "TOTAL_DURATION Config set successfully");
         }
     }
     vTaskDelay(pdMS_TO_TICKS(5));
