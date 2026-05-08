@@ -133,7 +133,7 @@ inline constexpr uint8_t INTF_NDEF         = 0x06;
 inline constexpr uint8_t INTF_TAGCMD       = 0x80;
 
 // --- PN7160 Specific ---
-inline constexpr uint16_t PN7160_DEFAULT_TIMEOUT_MS = 10;
+inline constexpr uint16_t PN7160_DEFAULT_TIMEOUT_MS = 500;
 inline constexpr uint16_t PN7160_INIT_TIMEOUT_MS    = 500;
 inline constexpr uint16_t PN7160_IRQ_TIMEOUT_MS     = 250;
 inline constexpr size_t   NCI_HEADER_SIZE            = 3;
@@ -581,6 +581,8 @@ private:
     SemaphoreHandle_t  sync_sem_     = nullptr;
     std::atomic<bool>  sync_pending_{false};
     SyncExchange       exchange_{};
+
+    SemaphoreHandle_t  transport_mutex_    = nullptr;
 
     // --- App-facing priority event ring buffer ---
     static constexpr size_t EVENT_QUEUE_SIZE = 10;

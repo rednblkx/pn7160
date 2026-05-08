@@ -20,11 +20,13 @@ PN7160_NCI::PN7160_NCI(IPN7160Transport& transport)
     : transport_(transport) {
     sync_sem_   = xSemaphoreCreateBinary();
     sync_mutex_ = xSemaphoreCreateMutex();
+    transport_mutex_  = xSemaphoreCreateMutex();
 
-    if (!sync_sem_ || !sync_mutex_ || !event_ring_.valid()) {
+    if (!sync_sem_ || !sync_mutex_ || !transport_mutex_ || !event_ring_.valid()) {
         ESP_LOGE(TAG, "Failed to create synchronization primitives");
         if (sync_sem_)   vSemaphoreDelete(sync_sem_);
         if (sync_mutex_) vSemaphoreDelete(sync_mutex_);
+        if (transport_mutex_)  vSemaphoreDelete(transport_mutex_);
     }
 }
 
@@ -37,6 +39,10 @@ PN7160_NCI::~PN7160_NCI() {
     if (sync_mutex_) {
         vSemaphoreDelete(sync_mutex_);
         sync_mutex_ = nullptr;
+    }
+    if (transport_mutex_) {
+        vSemaphoreDelete(transport_mutex_);
+        transport_mutex_ = nullptr;
     }
 }
 
@@ -147,6 +153,12 @@ esp_err_t PN7160_NCI::write_nci_packet(const NciMessage& msg) {
     if (msg.size() == 0 || msg.size() > nci::NCI_MAX_PACKET_SIZE)
         return ESP_ERR_INVALID_ARG;
 
+    ScopedMutex lock(transport_mutex_, pdMS_TO_TICKS(nci::PN7160_DEFAULT_TIMEOUT_MS));
+    if (!lock.acquired()) {
+        ESP_LOGE(TAG, "write_nci_packet: failed to acquire SPI mutex");
+        return ESP_ERR_TIMEOUT;
+    }
+
     ESP_LOGD(TAG, "Write NCI Packet (%zu bytes):", msg.size());
     ESP_LOG_BUFFER_HEXDUMP(TAG, msg.data(), msg.size(), ESP_LOG_DEBUG);
     return transport_.write(msg.data(), msg.size());
@@ -224,7 +236,11 @@ esp_err_t PN7160_NCI::send_command_wait_response(NciMessage& cmd,
         esp_err_t err = write_nci_packet(cmd);
         if (err != ESP_OK) return err;
 
-        err = read_nci_packet(rsp, timeout_ms);
+        {
+            ScopedMutex lock(transport_mutex_, pdMS_TO_TICKS(timeout_ms));
+            if (!lock.acquired()) return ESP_ERR_TIMEOUT;
+            err = read_nci_packet(rsp, timeout_ms);
+        }
         if (err != ESP_OK) return err;
 
         // Validate GID + OID match before accepting.
@@ -372,7 +388,11 @@ esp_err_t PN7160_NCI::core_reset(bool reset_config,
     if (transport_.read_irq_level()) {
         ESP_LOGW(TAG, "IRQ high after power cycle – clearing pending message");
         ntf.clear();
-        (void)read_nci_packet(ntf, 50);
+        {
+            ScopedMutex lock(transport_mutex_, pdMS_TO_TICKS(nci::PN7160_DEFAULT_TIMEOUT_MS));
+            if (!lock.acquired()) return ESP_ERR_TIMEOUT;
+            (void)read_nci_packet(ntf, 50);
+        }
     }
 
     cmd.build(nci::PKT_MT_CTRL_COMMAND, nci::CORE_GID, nci::CORE_RESET_OID,
@@ -387,7 +407,11 @@ esp_err_t PN7160_NCI::core_reset(bool reset_config,
         return nci::STATUS_FAILED;
     }
 
-    err = read_nci_packet(rsp, nci::PN7160_INIT_TIMEOUT_MS);
+    {
+        ScopedMutex lock(transport_mutex_, pdMS_TO_TICKS(nci::PN7160_INIT_TIMEOUT_MS));
+        if (!lock.acquired()) return ESP_ERR_TIMEOUT;
+        err = read_nci_packet(rsp, nci::PN7160_INIT_TIMEOUT_MS);
+    }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to read CORE_RESET_RSP (err=0x%X)", err);
         return nci::STATUS_FAILED;
@@ -401,7 +425,11 @@ esp_err_t PN7160_NCI::core_reset(bool reset_config,
     uint8_t rsp_status = rsp.get_status();
     ESP_LOGD(TAG, "CORE_RESET_RSP (status: 0x%02X)", rsp_status);
 
-    err = read_nci_packet(ntf, nci::PN7160_INIT_TIMEOUT_MS);
+    {
+        ScopedMutex lock(transport_mutex_, pdMS_TO_TICKS(nci::PN7160_INIT_TIMEOUT_MS));
+        if (!lock.acquired()) return ESP_ERR_TIMEOUT;
+        err = read_nci_packet(ntf, nci::PN7160_INIT_TIMEOUT_MS);
+    }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to read CORE_RESET_NTF (err=0x%X)", err);
         return nci::STATUS_FAILED;
@@ -557,7 +585,6 @@ esp_err_t PN7160_NCI::rf_iso_dep_presence_check() {
     NciMessage cmd(nci::PKT_MT_CTRL_COMMAND, nci::RF_GID,
                    nci::RF_ISO_DEP_NAK_PRESENCE_OID);
     ESP_LOGD(TAG, "Sending RF_ISO_DEP_NAK_PRESENCE_CMD");
-    // Fire-and-forget: the RSP/NTF arrives asynchronously via the task_runner.
     return write_nci_packet(cmd);
 }
 
@@ -611,8 +638,6 @@ void PN7160_NCI::update_driver_state(const NciMessage& msg) {
             break;
 
         case nci::RF_ISO_DEP_NAK_PRESENCE_OID:
-            // This OID can arrive as either NTF (from task loop) or RSP
-            // (caught in dispatch_control_response below).  Handle both.
             if (msg.get_len() >= 1) {
                 bool present = (msg[3] == 0x00);
                 tag_in_field_.store(present);
@@ -672,10 +697,8 @@ void PN7160_NCI::handle_core_notification(uint8_t oid, const NciMessage& msg) {
 void PN7160_NCI::enqueue_notification(const NciMessage& msg) {
     ESP_LOGD(TAG, "NTF: GID=0x%02X OID=0x%02X", msg.get_gid(), msg.get_oid());
 
-    // 1. Update driver state first (tag_in_field_, etc.)
     update_driver_state(msg);
 
-    // 2. Forward to app queue.
     if (msg.get_gid() == nci::RF_GID)
         handle_rf_notification(msg.get_oid(), msg);
     else if (msg.get_gid() == nci::CORE_GID)
@@ -740,7 +763,7 @@ void PN7160_NCI::task_runner() {
 
     NciMessage incoming;
     while (!stop_flag_.load()) {
-        esp_err_t ret = transport_.wait_for_irq(true, pdMS_TO_TICKS(100));
+        esp_err_t ret = transport_.wait_for_irq(true, pdMS_TO_TICKS(nci::PN7160_DEFAULT_TIMEOUT_MS));
 
         if (ret == ESP_ERR_TIMEOUT) {
             // Normal idle – nothing to read.
@@ -754,7 +777,19 @@ void PN7160_NCI::task_runner() {
             continue;
         }
 
-        ret = read_nci_packet(incoming, nci::PN7160_DEFAULT_TIMEOUT_MS);
+        {
+            ScopedMutex lock(transport_mutex_, pdMS_TO_TICKS(nci::PN7160_DEFAULT_TIMEOUT_MS));
+            if (!lock.acquired()) {
+                ESP_LOGE(TAG, "task_runner: failed to acquire SPI mutex");
+                continue;
+            }
+
+            if (!transport_.read_irq_level()) {
+                continue;
+            }
+
+            ret = read_nci_packet(incoming, nci::PN7160_DEFAULT_TIMEOUT_MS);
+        }
         if (ret == ESP_ERR_TIMEOUT) {
             ESP_LOGW(TAG, "Timeout reading NCI packet after IRQ trigger");
             continue;
@@ -766,16 +801,13 @@ void PN7160_NCI::task_runner() {
             continue;
         }
 
-        // Step 1: try to satisfy a waiting synchronous caller.
         if (try_complete_exchange(incoming)) continue;
 
-        // Step 2: classify and dispatch to the app ring buffer.
         switch (incoming.get_mt()) {
             case nci::PKT_MT_CTRL_NOTIFICATION:
                 enqueue_notification(incoming);
                 break;
             case nci::PKT_MT_CTRL_RESPONSE:
-                // Unsolicited RSP (e.g. presence check fired asynchronously).
                 handle_unsolicited_response(incoming, tag_in_field_, TAG);
                 break;
             case nci::PKT_MT_DATA:
@@ -789,5 +821,5 @@ void PN7160_NCI::task_runner() {
 
     ESP_LOGI(TAG, "PN7160 task runner stopping.");
     task_handle_ = nullptr;
-    vTaskDelete(nullptr);
+    vTaskDelete(NULL);
 }
