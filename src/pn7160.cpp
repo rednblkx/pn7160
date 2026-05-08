@@ -487,6 +487,23 @@ esp_err_t PN7160_NCI::core_set_config(const std::vector<uint8_t>& config_params)
     return status;
 }
 
+esp_err_t PN7160_NCI::core_get_config(const std::vector<uint8_t>& config_params, NciMessage& rsp) {
+    NciMessage cmd(nci::PKT_MT_CTRL_COMMAND, nci::CORE_GID,
+                   nci::CORE_GET_CONFIG_OID, config_params);
+    esp_err_t status = send_command_wait_response(cmd, rsp, nci::PN7160_INIT_TIMEOUT_MS);
+    if (status == nci::STATUS_INVALID_PARAM) {
+        ESP_LOGW(TAG, "CORE_GET_CONFIG_RSP: invalid parameters");
+        if (rsp.get_len() > 1) {
+            ESP_LOGW(TAG, "  Num Invalid: %d", rsp[4]);
+            if (rsp.get_len() > 2)
+                ESP_LOG_BUFFER_HEXDUMP(TAG, rsp.data() + 5, rsp.get_len() - 2, ESP_LOG_WARN);
+        }
+    } else if (status != nci::STATUS_OK) {
+        ESP_LOGE(TAG, "CORE_GET_CONFIG failed (NCI Status=0x%02X)", status);
+    }
+    return status;
+}
+
 esp_err_t PN7160_NCI::rf_discover_map(const std::vector<uint8_t>& mappings) {
     NciMessage cmd(nci::PKT_MT_CTRL_COMMAND, nci::RF_GID,
                    nci::RF_DISCOVER_MAP_OID, mappings);

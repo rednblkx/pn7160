@@ -493,6 +493,7 @@ public:
                                        NciMessage& ntf);
     [[nodiscard]] esp_err_t core_init(NciMessage& cmd, NciMessage& rsp);
     [[nodiscard]] esp_err_t core_set_config(const std::vector<uint8_t>& config_params);
+    [[nodiscard]] esp_err_t core_get_config(const std::vector<uint8_t>& config_params, NciMessage& rsp);
     [[nodiscard]] esp_err_t rf_discover_map(const std::vector<uint8_t>& mappings);
     [[nodiscard]] esp_err_t rf_set_listen_mode_routing(const std::vector<uint8_t>& routing_config);
     [[nodiscard]] esp_err_t rf_start_discovery(const std::vector<uint8_t>& discovery_config);
