@@ -283,6 +283,15 @@ void PN7160_SPI::chip_select(bool assert) {
 esp_err_t PN7160_SPI::spi_transfer(spi_transaction_t* trans) {
     esp_rom_delay_us(5); // Tcs_setup
     chip_select(true);
+
+    if (!read_irq_level()) {
+        uint32_t wait_us = 0;
+        while (!read_irq_level() && wait_us < 2000) {
+            esp_rom_delay_us(5);
+            wait_us += 5;
+        }
+    }
+
     esp_rom_delay_us(5); // Tcsh_setup
 
     esp_err_t ret = spi_device_polling_transmit(device_, trans);
