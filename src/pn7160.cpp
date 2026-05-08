@@ -753,6 +753,7 @@ static void handle_unsolicited_response(const NciMessage& msg,
 // =============================================================================
 
 void PN7160_NCI::task_runner() {
+    task_running_.store(true);
     if (!initialized_.load()) {
         ESP_LOGE(TAG, "task_runner started but driver not initialized!");
         vTaskDelete(nullptr);
@@ -821,5 +822,6 @@ void PN7160_NCI::task_runner() {
 
     ESP_LOGI(TAG, "PN7160 task runner stopping.");
     task_handle_ = nullptr;
+    task_running_.store(false);
     vTaskDelete(NULL);
 }

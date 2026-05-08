@@ -533,7 +533,8 @@ public:
 
     bool is_initialized() const { return initialized_.load(); }
     bool tag_in_field()   const { return tag_in_field_.load(); }
-
+    bool is_task_running() const { return task_running_.load(); }
+    
 private:
     // --- Transport access (exclusively owned by task_runner once started) ---
     [[nodiscard]] esp_err_t read_nci_packet(NciMessage& msg, uint32_t timeout_ms);
@@ -570,6 +571,7 @@ private:
     IPN7160Transport& transport_;
 
     TaskHandle_t       task_handle_ = nullptr;
+    std::atomic<bool>  task_running_{false};
     std::atomic<bool>  initialized_{false};
     std::atomic<bool>  stop_flag_{false};
     std::atomic<bool>  tag_in_field_{false};
