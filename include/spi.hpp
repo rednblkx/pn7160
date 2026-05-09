@@ -11,7 +11,8 @@
 
 // PN7160 SPI Transfer Direction Discriminator bytes (UM11495 Table 7)
 static constexpr uint8_t PN7160_SPI_TDD_READ  = 0xFF;
-static constexpr uint8_t PN7160_SPI_TDD_WRITE = 0x0A;
+static constexpr uint8_t PN7160_SPI_TDD_WRITE = 0x7F; // Chip only looks for MSB == 0, rest helps reduce line toggling
+static constexpr uint8_t PN7160_SPI_MISO_ACK  = 0xFF; // Used to verify if the chip accepted a write
 
 // Max application payload (255) + NCI header (3) + SPI TDD (1)
 static constexpr size_t MAX_SPI_TRANSFER = 260;
