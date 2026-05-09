@@ -181,8 +181,9 @@ esp_err_t PN7160_SPI::read(uint8_t* buffer, size_t length) {
 
     // We successfully completed the read, the PN7160 will drop the IRQ line.
     // It is now safe to unmask the interrupt for the next event.
-    gpio_intr_enable(pins_.irq);
-
+    if (gpio_get_level(pins_.irq) == 0) {
+        gpio_intr_enable(pins_.irq);
+    }
     return ret;
 }
 
