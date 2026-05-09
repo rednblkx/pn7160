@@ -48,18 +48,18 @@ public:
      * @param clock_mhz     SPI clock speed in MHz (default 4 MHz).
      */
     PN7160_SPI(spi_host_device_t host,
-                         const PN7160_SPI_Config& pins,
-                         int clock_mhz = 4);
+               const PN7160_SPI_Config& pins,
+               int clock_mhz = 4);
     ~PN7160_SPI() override;
 
     [[nodiscard]] esp_err_t init()   override;
-    void                      deinit() override;
+    void                    deinit() override;
 
     [[nodiscard]] esp_err_t read(uint8_t* buffer, size_t length) override;
     [[nodiscard]] esp_err_t write(const uint8_t* buffer, size_t length) override;
 
     [[nodiscard]] esp_err_t wait_for_irq(bool expected_level,
-                           TickType_t timeout_ticks) override;
+                                         TickType_t timeout_ticks) override;
     bool read_irq_level() const override;
 
     void set_ven(bool enable) override;
@@ -68,8 +68,8 @@ public:
 private:
     // --- GPIO helpers ---
     [[nodiscard]] esp_err_t configure_gpio_output(gpio_num_t pin, bool initial_level,
-                                    bool pullup = false);
-    void      chip_select(bool assert); ///< assert=true drives CS low
+                                                  bool pullup = false);
+    void chip_select(bool assert); ///< assert=true drives CS low
 
     // --- SPI raw transfer ---
     [[nodiscard]] esp_err_t spi_transfer(spi_transaction_t* trans);
@@ -80,13 +80,13 @@ private:
 
     // --- State ---
     spi_host_device_t    host_;
-    PN7160_SPI_Config pins_;
+    PN7160_SPI_Config    pins_;
     int                  clock_hz_;
-    spi_device_handle_t  device_       = nullptr;
-    SemaphoreHandle_t    irq_sem_      = nullptr;
-    SemaphoreHandle_t    spi_mutex_    = nullptr;
-    bool                 isr_installed_ = false;
-    bool                 initialized_  = false;
+    spi_device_handle_t  device_          = nullptr;
+    SemaphoreHandle_t    irq_sem_         = nullptr;
+    SemaphoreHandle_t    spi_mutex_       = nullptr;
+    bool                 isr_installed_   = false;
+    bool                 initialized_     = false;
     bool                 bus_initialized_ = false;
 
     // DMA-aligned transfer buffers (heap-allocated as class members to

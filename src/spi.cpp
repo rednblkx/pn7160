@@ -15,8 +15,8 @@
 // ---------------------------------------------------------------------------
 
 PN7160_SPI::PN7160_SPI(spi_host_device_t host,
-                                           const PN7160_SPI_Config& pins,
-                                           int clock_mhz)
+                       const PN7160_SPI_Config& pins,
+                       int clock_mhz)
     : host_(host),
       pins_(pins),
       clock_hz_(clock_mhz * 1000 * 1000) {
@@ -40,7 +40,6 @@ PN7160_SPI::~PN7160_SPI() {
 
 esp_err_t PN7160_SPI::init() {
     if (initialized_) return ESP_OK;
-
     if (!irq_sem_) return ESP_ERR_NO_MEM;
 
     spi_bus_config_t bus {
@@ -59,6 +58,7 @@ esp_err_t PN7160_SPI::init() {
     if (ret == ESP_OK) {
         bus_initialized_ = true;
     }
+
     // --- VEN (output, start low = chip in reset) ---
     if (pins_.ven != GPIO_NUM_NC) {
         ESP_RETURN_ON_ERROR(configure_gpio_output(pins_.ven, /*level=*/false),
@@ -68,8 +68,7 @@ esp_err_t PN7160_SPI::init() {
     }
 
     // --- CS (output, start high = deselected, pull-up to keep stable) ---
-    ESP_RETURN_ON_ERROR(configure_gpio_output(pins_.cs, /*level=*/true,
-                                              /*pullup=*/true),
+    ESP_RETURN_ON_ERROR(configure_gpio_output(pins_.cs, /*level=*/true, /*pullup=*/true),
                         TAG, "CS pin config failed");
 
     // --- Optional: DWL_REQ ---
@@ -94,6 +93,7 @@ esp_err_t PN7160_SPI::init() {
     devcfg.spics_io_num   = -1;            // Manual CS
     devcfg.flags          = 0;
     devcfg.queue_size     = 3;
+
     ESP_RETURN_ON_ERROR(spi_bus_add_device(host_, &devcfg, &device_),
                         TAG, "Failed to add SPI device");
     ESP_LOGI(TAG, "SPI device added at %d MHz", clock_hz_ / 1'000'000);
@@ -208,8 +208,7 @@ esp_err_t PN7160_SPI::write(const uint8_t* buffer, size_t length) {
 // IPN7160Transport — IRQ
 // ---------------------------------------------------------------------------
 
-esp_err_t PN7160_SPI::wait_for_irq(bool expected_level,
-                                              TickType_t timeout_ticks) {
+esp_err_t PN7160_SPI::wait_for_irq(bool expected_level, TickType_t timeout_ticks) {
     if (gpio_get_level(pins_.irq) == expected_level) return ESP_OK;
 
     if (!expected_level) {
@@ -256,9 +255,7 @@ void PN7160_SPI::set_ven(bool enable) {
 // Private — GPIO helpers
 // ---------------------------------------------------------------------------
 
-esp_err_t PN7160_SPI::configure_gpio_output(gpio_num_t pin,
-                                                       bool initial_level,
-                                                       bool pullup) {
+esp_err_t PN7160_SPI::configure_gpio_output(gpio_num_t pin, bool initial_level, bool pullup) {
     gpio_config_t cfg = {
         .pin_bit_mask = 1ULL << pin,
         .mode         = GPIO_MODE_OUTPUT,
