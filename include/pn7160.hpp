@@ -118,6 +118,8 @@ public:
     [[nodiscard]] esp_err_t send_data_packet(const NciMessage& data_pkt);
     [[nodiscard]] esp_err_t get_event(NciEvent& event, uint32_t timeout_ms = portMAX_DELAY);
 
+    [[nodiscard]] uint16_t get_firmware_version() const;
+
     void task_runner();
 
     [[nodiscard]] bool is_initialized() const { return initialized_.load(); }
@@ -152,4 +154,5 @@ private:
     NciEventRingBuffer<EVENT_QUEUE_SIZE> event_ring_;
 
     static constexpr const char* TAG = "PN7160_NCI";
+    uint8_t fw_version_[3]{};
 };

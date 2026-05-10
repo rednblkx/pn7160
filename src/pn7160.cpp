@@ -250,7 +250,20 @@ esp_err_t PN7160_NCI::core_reset(bool reset_config) {
 
     err = read_nci_packet(ntf, nci::PN7160_INIT_TIMEOUT_MS);
     if (err != ESP_OK || !ntf.is_control_notification(nci::CORE_GID, nci::CORE_RESET_OID)) return nci::STATUS_FAILED;
-
+    auto data = ntf.get_payload();
+    if (data.size() == 9) {
+        ESP_LOGI(TAG, "NCI Version: %x.%x", data[2] >> 4, data[2] & 0x0f);
+        ESP_LOGI(TAG, "Manufacturer ID: %x", data[3]);
+        if (data[4] == 0x04) {
+            ESP_LOGI(TAG, "Hardware version number: %x", data[5]);
+            fw_version_[0] = data[6];
+            ESP_LOGI(TAG, "ROM Code version number: %x", data[6]);
+            fw_version_[1] = data[7];
+            ESP_LOGI(TAG, "FLASH Major version: %x", data[7]);
+            fw_version_[2] = data[8];
+            ESP_LOGI(TAG, "FLASH Minor version: %x", data[8]);
+        }
+    }
     return rsp_status;
 }
 
@@ -331,6 +344,10 @@ esp_err_t PN7160_NCI::get_event(NciEvent& event, uint32_t timeout_ms) {
         if (timeout_ms != portMAX_DELAY && elapsed >= timeout_ms) return ESP_ERR_TIMEOUT;
     }
     return ESP_ERR_INVALID_STATE;
+}
+
+uint16_t PN7160_NCI::get_firmware_version() const {
+    return fw_version_[1] << 8 | fw_version_[2];
 }
 
 // =============================================================================
