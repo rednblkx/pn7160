@@ -225,14 +225,14 @@ esp_err_t PN7160_NCI::send_data_packet(const NciMessage& data_pkt) {
 esp_err_t PN7160_NCI::core_reset(bool reset_config) {
     if (transport_.has_ven()) {
         transport_.set_ven(false);
-        vTaskDelay(pdMS_TO_TICKS(nci::PN7160_DEFAULT_TIMEOUT_MS));
+        vTaskDelay(pdMS_TO_TICKS(5));
         transport_.set_ven(true);
-        vTaskDelay(pdMS_TO_TICKS(nci::PN7160_DEFAULT_TIMEOUT_MS));
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 
     NciMessage ntf;
     if (transport_.read_irq_level()) {
-        (void)read_nci_packet(ntf, 50);
+        (void)read_nci_packet(ntf, nci::PN7160_INIT_TIMEOUT_MS);
     }
 
     NciMessage cmd, rsp;
@@ -455,7 +455,7 @@ void PN7160_NCI::task_runner() {
 
     NciMessage incoming;
     while (!stop_flag_.load()) {
-        esp_err_t ret = transport_.wait_for_irq(true, pdMS_TO_TICKS(nci::PN7160_DEFAULT_TIMEOUT_MS));
+        esp_err_t ret = transport_.wait_for_irq(true, pdMS_TO_TICKS(10));
 
         if (ret == ESP_ERR_TIMEOUT) continue;
         if (ret != ESP_OK) {

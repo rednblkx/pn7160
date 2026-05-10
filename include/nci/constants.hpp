@@ -126,8 +126,8 @@ inline constexpr uint8_t INTF_NDEF         = 0x06;
 inline constexpr uint8_t INTF_TAGCMD       = 0x80;
 
 // --- PN7160 Specific ---
-inline constexpr uint16_t PN7160_DEFAULT_TIMEOUT_MS = 500;
-inline constexpr uint16_t PN7160_INIT_TIMEOUT_MS    = 500;
+inline constexpr uint16_t PN7160_DEFAULT_TIMEOUT_MS = 200;
+inline constexpr uint16_t PN7160_INIT_TIMEOUT_MS    = 200;
 inline constexpr uint16_t PN7160_IRQ_TIMEOUT_MS     = 250;
 inline constexpr size_t   NCI_HEADER_SIZE            = 3;
 inline constexpr size_t   NCI_MAX_PAYLOAD_SIZE       = 255;
