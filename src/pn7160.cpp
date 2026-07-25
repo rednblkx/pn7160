@@ -3,6 +3,8 @@
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_log_buffer.h"
+#include "nci/event.hpp"
 
 // =============================================================================
 // Constructor / Destructor
@@ -143,7 +145,21 @@ bool PN7160_NCI::try_complete_exchange(const NciMessage& msg) {
     if (promise_.waiting_task.load(std::memory_order_acquire) == nullptr) return false;
 
     if (msg.get_mt() == nci::PKT_MT_DATA) {
-        return promise_.complete(msg, ESP_OK);
+      if (promise_.result.empty()) {
+          promise_.result = msg;
+      } else {
+          auto chunk = msg.get_payload();
+          for (uint8_t b : chunk) {
+              promise_.result.push_back(b);
+          }
+          promise_.result.data()[2] = static_cast<uint8_t>(promise_.result.get_len() + chunk.size());
+      }
+
+      if (msg.get_pbf() == 1) {
+          return true; // Keep waiting for PBF == 0
+      }
+
+      return promise_.complete(promise_.result);
     }
 
     if (msg.get_mt() == nci::PKT_MT_CTRL_RESPONSE &&
@@ -205,11 +221,8 @@ std::expected<std::vector<uint8_t>, esp_err_t> PN7160_NCI::send_apdu_sync(
     }
 
     err = promise_.wait(timeout_ms);
-    if (err != ESP_OK) return std::unexpected(err);
+    if (err != ESP_OK || promise_.result.empty()) return std::unexpected(ESP_FAIL);
 
-    if (promise_.result.empty()) return std::unexpected(ESP_FAIL);
-
-    // Returns the vector copy securely to the Application Thread
     return promise_.result.get_payload_copy();
 }
 

@@ -150,7 +150,7 @@ private:
 
     NciPromise         promise_{};
 
-    static constexpr size_t EVENT_QUEUE_SIZE = 10;
+    static constexpr size_t EVENT_QUEUE_SIZE = 20;
     NciEventRingBuffer<EVENT_QUEUE_SIZE> event_ring_;
 
     static constexpr const char* TAG = "PN7160_NCI";
