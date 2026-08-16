@@ -41,7 +41,14 @@ PN7160_SPI::~PN7160_SPI() {
 
 esp_err_t PN7160_SPI::init() {
     if (initialized_) return ESP_OK;
-    if (!irq_sem_) return ESP_ERR_NO_MEM;
+    if (!irq_sem_) {
+        irq_sem_ = xSemaphoreCreateBinary();
+        if (!irq_sem_) return ESP_ERR_NO_MEM;
+    }
+    if (!spi_mutex_) {
+        spi_mutex_ = xSemaphoreCreateMutex();
+        if (!spi_mutex_) return ESP_ERR_NO_MEM;
+    }
 
     spi_bus_config_t bus {
         .mosi_io_num = pins_.mosi,
@@ -108,6 +115,7 @@ esp_err_t PN7160_SPI::init() {
 }
 
 void PN7160_SPI::deinit() {
+    gpio_intr_disable(pins_.irq);
     if (isr_installed_) {
         gpio_isr_handler_remove(pins_.irq);
         isr_installed_ = false;
