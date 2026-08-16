@@ -288,18 +288,18 @@ void PN7160_SPI::chip_select(bool assert) {
 }
 
 esp_err_t PN7160_SPI::spi_transfer(spi_transaction_t* trans) {
+    spi_device_acquire_bus(device_, portMAX_DELAY);
     esp_rom_delay_us(5); // Tcs_setup (UM11495 strict timing)
     chip_select(true);
     esp_rom_delay_us(5); // Tcsh_setup
 
-    spi_device_acquire_bus(device_, portMAX_DELAY);
     esp_err_t ret = spi_device_polling_transmit(device_, trans);
-    spi_device_release_bus(device_);
 
     esp_rom_delay_us(5); // Tcsh_hold
     chip_select(false);
     esp_rom_delay_us(5); // Tcs_hold
 
+    spi_device_release_bus(device_);
     return ret;
 }
 
