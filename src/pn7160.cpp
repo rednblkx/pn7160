@@ -4,6 +4,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_log_buffer.h"
+#include "esp_log_level.h"
 #include "nci/event.hpp"
 
 // =============================================================================
@@ -78,16 +79,12 @@ esp_err_t PN7160_NCI::start() {
 void PN7160_NCI::stop() {
     shutdown();
     if (task_handle_) {
+        stop_flag_.store(true);
         int wait = 0;
-        while (task_running_.load() && wait < 500) {
+        while (task_running_.load() && wait < 50) {
             vTaskDelay(pdMS_TO_TICKS(10));
             ++wait;
         }
-        if (task_running_.load()) {
-            vTaskDelete(task_handle_);
-            task_running_.store(false);
-        }
-        ESP_LOGI(TAG, "Task stopped");
         task_handle_ = nullptr;
     }
 }
