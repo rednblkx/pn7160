@@ -120,11 +120,8 @@ void PN7160_SPI::deinit() {
         ESP_LOGI(TAG, "SPI device removed");
     }
 
-    if (bus_initialized_) {
-        spi_bus_free(host_);
-        bus_initialized_ = false;
-        ESP_LOGI(TAG, "SPI bus freed");
-    }
+    // DO NOT call spi_bus_free(host_) as it corrupts the shared SPI bus lock.
+    bus_initialized_ = false;
 
     // Drive VEN low to keep chip in reset
     if (pins_.ven != GPIO_NUM_NC) {
@@ -178,12 +175,6 @@ esp_err_t PN7160_SPI::read(uint8_t* buffer, size_t length) {
     }
 
     xSemaphoreGive(spi_mutex_);
-
-    // We successfully completed the read, the PN7160 will drop the IRQ line.
-    // It is now safe to unmask the interrupt for the next event.
-    if (gpio_get_level(pins_.irq) == 0) {
-        gpio_intr_enable(pins_.irq);
-    }
     return ret;
 }
 
@@ -194,11 +185,8 @@ esp_err_t PN7160_SPI::write(const uint8_t* buffer, size_t length) {
     if (!spi_mutex_) return ESP_ERR_INVALID_STATE;
     if (xSemaphoreTake(spi_mutex_, portMAX_DELAY) != pdTRUE) return ESP_FAIL;
 
-    // Wait for any pending read for max 15ms before write to avoid packet
-    // corruption if the chip asserts IRQ right as we try to write.
     int wait_retries = 5;
     while (read_irq_level() && wait_retries-- > 0) {
-        ESP_LOGW(TAG, "IRQ high during write, waiting to avoid collision...");
         vTaskDelay(pdMS_TO_TICKS(3));
     }
 
@@ -253,34 +241,25 @@ esp_err_t PN7160_SPI::wait_for_irq(bool expected_level, TickType_t timeout_ticks
         return ESP_ERR_INVALID_STATE;
     }
 
-    // Drain any stale semaphore count before blocking.
     xSemaphoreTake(irq_sem_, 0);
 
     if (xSemaphoreTake(irq_sem_, timeout_ticks) == pdTRUE) {
         if (gpio_get_level(pins_.irq) == expected_level) return ESP_OK;
-
         ESP_LOGW(TAG, "IRQ semaphore received but pin is LOW?");
-        gpio_intr_enable(pins_.irq); // Recover ISR state
         return ESP_FAIL;
     }
 
-    // One last level check — the edge may have arrived just as the timeout fired.
     if (gpio_get_level(pins_.irq) == expected_level) {
         ESP_LOGW(TAG, "IRQ went HIGH right at timeout boundary");
         return ESP_OK;
     }
 
-    gpio_intr_enable(pins_.irq); // Recover ISR state on timeout
     return ESP_ERR_TIMEOUT;
 }
 
 bool PN7160_SPI::read_irq_level() const {
     return gpio_get_level(pins_.irq) != 0;
 }
-
-// ---------------------------------------------------------------------------
-// IPN7160Transport — Power
-// ---------------------------------------------------------------------------
 
 void PN7160_SPI::set_ven(bool enable) {
     if (pins_.ven != GPIO_NUM_NC) {
@@ -290,10 +269,6 @@ void PN7160_SPI::set_ven(bool enable) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
-
-// ---------------------------------------------------------------------------
-// Private — GPIO helpers
-// ---------------------------------------------------------------------------
 
 esp_err_t PN7160_SPI::configure_gpio_output(gpio_num_t pin, bool initial_level, bool pullup) {
     gpio_config_t cfg = {
@@ -309,13 +284,8 @@ esp_err_t PN7160_SPI::configure_gpio_output(gpio_num_t pin, bool initial_level, 
 }
 
 void PN7160_SPI::chip_select(bool assert) {
-    // CS is active-low.
     gpio_set_level(pins_.cs, assert ? 0 : 1);
 }
-
-// ---------------------------------------------------------------------------
-// Private — Raw SPI transfer
-// ---------------------------------------------------------------------------
 
 esp_err_t PN7160_SPI::spi_transfer(spi_transaction_t* trans) {
     esp_rom_delay_us(5); // Tcs_setup (UM11495 strict timing)
@@ -333,17 +303,13 @@ esp_err_t PN7160_SPI::spi_transfer(spi_transaction_t* trans) {
     return ret;
 }
 
-// ---------------------------------------------------------------------------
-// Private — IRQ setup & ISR
-// ---------------------------------------------------------------------------
-
 esp_err_t PN7160_SPI::setup_irq() {
     gpio_config_t cfg = {
         .pin_bit_mask = 1ULL << pins_.irq,
         .mode         = GPIO_MODE_INPUT,
         .pull_up_en   = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_POSEDGE, // IRQ is active-high
+        .intr_type    = GPIO_INTR_POSEDGE, // Active high, trigger on rising edge
     };
     ESP_RETURN_ON_ERROR(gpio_config(&cfg), TAG, "IRQ pin config failed");
 
@@ -359,17 +325,11 @@ esp_err_t PN7160_SPI::setup_irq() {
         TAG, "Failed to add ISR handler");
 
     isr_installed_ = true;
-    ESP_LOGI(TAG, "IRQ configured on GPIO %d", pins_.irq);
     return ESP_OK;
 }
 
 void IRAM_ATTR PN7160_SPI::isr_handler(void* arg) {
     auto* self = static_cast<PN7160_SPI*>(arg);
-
-    // Mask IRQ immediately to prevent interrupt storms
-    // It will be re-enabled at the end of the user's PN7160_SPI::read()
-    gpio_intr_disable(self->pins_.irq);
-
     BaseType_t woken = pdFALSE;
     xSemaphoreGiveFromISR(self->irq_sem_, &woken);
     if (woken == pdTRUE) portYIELD_FROM_ISR();
