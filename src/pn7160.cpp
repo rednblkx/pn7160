@@ -6,6 +6,7 @@
 #include "esp_log_buffer.h"
 #include "esp_log_level.h"
 #include "nci/event.hpp"
+#include "portmacro.h"
 
 // =============================================================================
 // Constructor / Destructor
@@ -69,9 +70,16 @@ esp_err_t PN7160_NCI::initialize() {
 
 esp_err_t PN7160_NCI::start() {
     if (task_handle_) return ESP_ERR_INVALID_STATE;
-    BaseType_t ok = xTaskCreatePinnedToCore(
+    BaseType_t ok;
+#ifndef CONFIG_FREERTOS_UNICORE
+    ok = xTaskCreatePinnedToCore(
         [](void* arg) { static_cast<PN7160_NCI*>(arg)->task_runner(); vTaskDelete(NULL); },
-        "pn7160_runner", 4096, this, 4, &task_handle_, tskNO_AFFINITY);
+        "pn7160_runner", 4096, this, 4, &task_handle_, 1);
+#else
+    ok = xTaskCreate(
+        [](void* arg) { static_cast<PN7160_NCI*>(arg)->task_runner(); vTaskDelete(NULL); },
+        "pn7160_runner", 4096, this, 4, &task_handle_);
+#endif
     if (ok != pdPASS) return ESP_FAIL;
     return ESP_OK;
 }
