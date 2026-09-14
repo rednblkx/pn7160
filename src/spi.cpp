@@ -50,13 +50,12 @@ esp_err_t PN7160_SPI::init() {
         if (!spi_mutex_) return ESP_ERR_NO_MEM;
     }
 
-    spi_bus_config_t bus {
-        .mosi_io_num = pins_.mosi,
-        .miso_io_num = pins_.miso,
-        .sclk_io_num = pins_.sclk,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-    };
+    spi_bus_config_t bus{};
+    bus.mosi_io_num = pins_.mosi;
+    bus.miso_io_num = pins_.miso;
+    bus.sclk_io_num = pins_.sclk;
+    bus.quadwp_io_num = -1;
+    bus.quadhd_io_num = -1;
 
     esp_err_t ret = spi_bus_initialize(host_, &bus, SPI_DMA_CH_AUTO);
     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
@@ -205,13 +204,12 @@ esp_err_t PN7160_SPI::write(const uint8_t* buffer, size_t length) {
     const int MAX_RETRIES = 3;
 
     for (int retry = 0; retry < MAX_RETRIES; retry++) {
-        spi_transaction_t trans = {
-            .flags     = 0,
-            .length    = (length + 1) * 8,
-            .rxlength  = (length + 1) * 8,
-            .tx_buffer = tx_buf_,
-            .rx_buffer = rx_buf_,
-        };
+        spi_transaction_t trans{};
+        trans.flags = 0;
+        trans.length = (length + 1) * 8;
+        trans.rxlength = (length + 1) * 8;
+        trans.tx_buffer = tx_buf_;
+        trans.rx_buffer = rx_buf_;
 
         ret = spi_transfer(&trans);
 
@@ -279,13 +277,12 @@ void PN7160_SPI::set_ven(bool enable) {
 }
 
 esp_err_t PN7160_SPI::configure_gpio_output(gpio_num_t pin, bool initial_level, bool pullup) {
-    gpio_config_t cfg = {
-        .pin_bit_mask = 1ULL << pin,
-        .mode         = GPIO_MODE_OUTPUT,
-        .pull_up_en   = pullup ? GPIO_PULLUP_ENABLE : GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
-    };
+    gpio_config_t cfg{};
+    cfg.pin_bit_mask = 1ULL << pin;
+    cfg.mode = GPIO_MODE_OUTPUT;
+    cfg.pull_up_en = pullup ? GPIO_PULLUP_ENABLE : GPIO_PULLUP_DISABLE;
+    cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    cfg.intr_type = GPIO_INTR_DISABLE;
     ESP_RETURN_ON_ERROR(gpio_config(&cfg), TAG, "gpio_config output failed");
     gpio_set_level(pin, initial_level ? 1 : 0);
     return ESP_OK;
@@ -312,13 +309,12 @@ esp_err_t PN7160_SPI::spi_transfer(spi_transaction_t* trans) {
 }
 
 esp_err_t PN7160_SPI::setup_irq() {
-    gpio_config_t cfg = {
-        .pin_bit_mask = 1ULL << pins_.irq,
-        .mode         = GPIO_MODE_INPUT,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_POSEDGE, // Active high, trigger on rising edge
-    };
+    gpio_config_t cfg{};
+    cfg.pin_bit_mask = 1ULL << pins_.irq;
+    cfg.mode = GPIO_MODE_INPUT;
+    cfg.pull_up_en = GPIO_PULLUP_DISABLE;
+    cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    cfg.intr_type = GPIO_INTR_POSEDGE; // Active high, trigger on rising edge
     ESP_RETURN_ON_ERROR(gpio_config(&cfg), TAG, "IRQ pin config failed");
 
     esp_err_t ret = gpio_install_isr_service(ESP_INTR_FLAG_LEVEL1);
