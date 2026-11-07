@@ -1,0 +1,15 @@
+{
+    "name": "PN7160",
+    "license": "MIT",
+    "frameworks": [
+        "arduino",
+        "espidf"
+    ],
+    "platforms": [
+        "espressif32"
+    ],
+    "build": {
+        "includeDir": "include",
+        "srcDir": "src"
+    }
+}

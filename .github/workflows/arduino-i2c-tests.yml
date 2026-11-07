@@ -1,0 +1,17 @@
+name: Arduino I2C transport tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  transport-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test simulated Arduino and IDF APIs with sanitizers
+        run: python3 tests/arduino_i2c/run.py
