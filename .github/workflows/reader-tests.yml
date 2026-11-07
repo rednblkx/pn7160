@@ -1,0 +1,17 @@
+name: Arduino reader tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reader-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test reader lifecycle and protocol handling with sanitizers
+        run: python3 tests/reader/run.py

@@ -60,3 +60,45 @@ on timeouts, tick wrap, partial initialization failures and shared-bus teardown.
 IDF 5.3/5.4/5.5/6.0 error-mapping branches are simulated; these are not builds
 against all four real SDKs. Hardware validation and full SDK builds remain
 separate checks.
+
+## Arduino reader facade
+
+`PN7160_ArduinoReader` in `reader.hpp` combines transport ownership and the NCI
+engine into a lifecycle/discovery/UID/APDU interface. Set `Config::wire` to a
+shared `TwoWire` instance for I2C, or leave it null for SPI2 and supply SPI pins
+in CS, SCLK, MISO, MOSI order. IRQ and VEN are explicit in both modes.
+Call from one application task or synchronize access externally. The NCI engine
+owns its background runner; `stop()` stops it before releasing the transport.
+Copying and moving the facade are disabled.
+
+`init()` configures the reader and starts its runner. `beginDiscovery()` enables
+passive NFC-A discovery. `pollForTag()` returns UID/ATQA/SAK, including repeated
+activation events; the caller decides whether to suppress repeated presentations.
+`isTagStillPresent()` uses ISO-DEP presence probes and the engine's asynchronous
+presence state. A true result is not a fresh UID detection or authentication.
+`exchangeApdu()` operates only on a selected ISO-DEP tag.
+
+ECP is disabled by default. `setEcpFrame()` copies an optional 18-byte frame;
+`setEcpFrame(nullptr, 0)` stages disabling it. Set the frame before initialization
+or call `updateECP()` to apply a live change and restart discovery. The setter
+checks length, not CRC: the caller supplies a valid frame. The NCI configuration
+uses the first 16 bytes because the controller appends CRC-A. This API does not
+generate application identifiers or perform credential authentication.
+
+`Config::vantMv` selects the carried PN7161 PMU configuration for 3300/5000 mV;
+zero preserves the original automatic PMU query/configuration behavior. ECP and
+PMU commands are model-specific: this facade is not a claim of verified support
+on every PN7160/PN7161 variant or board. Match configuration to actual hardware.
+
+Real polling errors and failed presence writes invalidate connection state.
+`healthCheck()` cannot turn a latched connection fault into a healthy result;
+the caller must reinitialize. An idle polling timeout leaves the connection up.
+Failed APDU calls clear the output buffer, and failed initialization releases
+the engine/transport. The facade does not implement an application retry policy.
+
+Run `python3 tests/reader/run.py` for sanitizer tests compiling the real reader
+and I2C transport with the upstream packet representation, a scripted NCI engine
+and simulated SDK/SPI/I2C APIs. These exercise lifecycle, UID sizes, APDU gating,
+copied/disabled ECP data and connection faults; they do not test actual RF,
+NCI worker concurrency, or native SDK linking. Original donor attribution is
+retained in `LICENSE.HomeKey-ESP32`.
