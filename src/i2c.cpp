@@ -1,5 +1,4 @@
 #include "esp_idf_version.h"
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
 #include "i2c.hpp"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -132,4 +131,3 @@ void PN7160_I2C::set_ven(bool enabled) {
         vTaskDelay(delay_ticks(10));
     }
 }
-#endif
