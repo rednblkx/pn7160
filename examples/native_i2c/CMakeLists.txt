@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.16)
+get_filename_component(PN7160_COMPONENT_DIR "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+get_filename_component(PN7160_COMPONENT_NAME "${PN7160_COMPONENT_DIR}" NAME)
+set(EXTRA_COMPONENT_DIRS "${PN7160_COMPONENT_DIR}")
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(pn7160_native_i2c)
